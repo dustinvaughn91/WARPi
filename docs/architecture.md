@@ -42,7 +42,7 @@ See [mode-control investigation](mode-control-investigation.md).
 ```mermaid
 flowchart TD
     Human[Dustin / operator] --> WebShell[Local webshell or console]
-    Kernel[K.E.R.N.E.L. / OpenClaw] --> SSH[OpenSSH to kernel-agent]
+    Kernel[K.E.R.N.E.L. / OpenClaw] --> SSH[OpenSSH to dedicated automation identity]
     SSH --> WARPi[WARPi Raspberry Pi]
     WebShell --> WARPi
 

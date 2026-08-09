@@ -1,6 +1,6 @@
 flowchart TD
     Human[Dustin / operator] --> Console[Local webshell or console]
-    Kernel[K.E.R.N.E.L. / OpenClaw] --> SSH[OpenSSH to kernel-agent]
+    Kernel[K.E.R.N.E.L. / OpenClaw] --> SSH[OpenSSH to dedicated automation identity]
     Console --> WARPi[WARPi Raspberry Pi]
     SSH --> WARPi
 

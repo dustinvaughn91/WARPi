@@ -4,7 +4,7 @@ WARPi should expose a constrained, auditable control surface.
 
 ## Identities
 
-K.E.R.N.E.L. uses a dedicated `kernel-agent` identity for approved remote operations.
+K.E.R.N.E.L. uses a dedicated automation identity for approved remote operations.
 
 Routine K.E.R.N.E.L. interaction should prefer:
 
@@ -37,4 +37,3 @@ Never commit:
 - private evidence/captures
 - sensitive operational logs
 - credential-bearing configs
-

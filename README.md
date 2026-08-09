@@ -13,7 +13,7 @@ Baseline date: 2026-08-09
 - Role: portable cybersecurity field platform
 - Current mode: normal/trusted-client operation
 - Remote access: standard OpenSSH over approved private management path
-- K.E.R.N.E.L. access: dedicated `kernel-agent` identity with approved wrappers
+- K.E.R.N.E.L. access: dedicated automation identity with approved wrappers
 - Live state source: `/run/warpi/state.json`
 - Primary service: `warpi-kernel.service`
 - Field UI: `warpi-ui.service`
@@ -35,4 +35,3 @@ Wireless testing is limited to systems and networks explicitly authorized for Va
 ## Current Rule
 
 Make WARPi boring and reliable first. Then make it ridiculous.
-

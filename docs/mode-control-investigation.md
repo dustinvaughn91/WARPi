@@ -25,8 +25,8 @@ Current mode/state reporting is owned by:
 
 `/opt/warpi/kernel.py` still defaults to external transition scripts:
 
-- `FIELD_MODE_SCRIPT` -> `/home/anangrybull/scripts/fieldmode`
-- `NORMAL_MODE_SCRIPT` -> `/home/anangrybull/scripts/normalmode`
+- `FIELD_MODE_SCRIPT` -> `<legacy-user-home>/scripts/fieldmode`
+- `NORMAL_MODE_SCRIPT` -> `<legacy-user-home>/scripts/normalmode`
 
 `enter_field_mode()` and `return_to_normal_mode()` still call those external scripts. If a transition is required while those paths are missing, the transition should fail rather than silently work.
 
