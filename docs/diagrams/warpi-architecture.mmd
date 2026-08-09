@@ -1,0 +1,21 @@
+flowchart TD
+    Human[Dustin / operator] --> Console[Local webshell or console]
+    Kernel[K.E.R.N.E.L. / OpenClaw] --> SSH[OpenSSH to kernel-agent]
+    Console --> WARPi[WARPi Raspberry Pi]
+    SSH --> WARPi
+
+    WARPi --> State[/run/warpi/state.json]
+    WARPi --> KernelSvc[warpi-kernel.service]
+    WARPi --> UiSvc[warpi-ui.service]
+    WARPi --> GPS[GPSD / u-blox GPS]
+    WARPi --> Wireless[Wireless adapters]
+    WARPi --> Tools[Approved security tooling]
+    WARPi --> Mission[Mission Control health/API]
+
+    KernelSvc --> State
+    State --> Status[warpi-status / kernel-report]
+    State --> Display[TFT display state]
+    Status --> Kernel
+
+    Nano[WiFi Pineapple NANO] -. optional future backend .-> WARPi
+
