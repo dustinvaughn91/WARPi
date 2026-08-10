@@ -4,7 +4,14 @@ WARPi should expose a constrained, auditable control surface.
 
 ## Identities
 
-K.E.R.N.E.L. uses a dedicated automation identity for approved remote operations.
+K.E.R.N.E.L. uses dedicated named identities for approved remote operations.
+
+Current live model:
+
+- `kernel`: administrative validation identity with key-based SSH and passwordless sudo for approved WARPi administration.
+- `kernel-agent`: constrained status/telemetry identity for read-oriented checks and future bounded command-surface work.
+
+The `kernel` account password is locked; access is through the approved public SSH key. The `kernel-agent` account remains useful while WARPi's safer command surface is being designed.
 
 Routine K.E.R.N.E.L. interaction should prefer:
 

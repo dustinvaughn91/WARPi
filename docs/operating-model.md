@@ -8,6 +8,7 @@ WARPi is a field platform, not just a toolbox. The platform should be predictabl
 - Backup before change: preserve known-good configs/scripts before major modifications.
 - GitHub is durable memory: meaningful architecture/configuration changes get documented.
 - Least privilege: K.E.R.N.E.L. should use bounded WARPi operations, not arbitrary root shell execution for routine work.
+- Administrative validation may use the `kernel` account, while routine status/telemetry should continue moving toward constrained commands and the `kernel-agent` identity.
 - Test after every meaningful change.
 - Keep daily checkpoints during active project work.
 - Wireless testing is limited to explicitly authorized VaughnLab systems and networks.
@@ -34,4 +35,3 @@ Pause before changing:
 - active wireless behavior
 - firmware/packages on attached devices
 - anything that may expose secrets or traffic captures
-
