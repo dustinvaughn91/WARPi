@@ -25,6 +25,7 @@ User-facing status is provided by:
 - `warpi help`
 - `warpi status`
 - `warpi mode status`
+- `warpi mode enter-field` dry-run plan
 - `warpi-status`
 - `kernel-report --json`
 - TFT display state/detail files
@@ -36,7 +37,7 @@ WARPi currently has two intended operating modes:
 - `NORMAL`: trusted network client mode.
 - `FIELD`: portable field assessment mode.
 
-Current mode reporting is implemented by `warpi-kernel.service`, supporting modules, and the `warpi mode status` command. Mode transition implementation is under review because legacy mode script references remain in the live system. `warpi mode enter-field` and `warpi mode return-normal` are not enabled yet.
+Current mode reporting is implemented by `warpi-kernel.service`, supporting modules, and the `warpi mode status` command. `warpi mode enter-field` currently renders a dry-run transition plan only; it does not change files, services, routes, radios, or NetworkManager profiles. Mode transition implementation is under review because legacy mode script references remain in the live system. `warpi mode enter-field --apply` and `warpi mode return-normal` are not enabled yet.
 
 See [mode-control investigation](mode-control-investigation.md).
 

@@ -11,7 +11,7 @@
 ## P1
 
 - Define the K.E.R.N.E.L./WARPi command contract.
-- Extend the structured `warpi` command surface beyond the initial help/menu and read-only mode status.
+- Extend the structured `warpi` command surface beyond the initial help/menu, read-only mode status, and dry-run Field Mode plan.
 - Validate field readiness: cold boot, trusted network, offline behavior, Tailscale reconnect, display status, logs/storage.
 - Review Bettercap service restart warning.
 - Review netplan permission warning.
