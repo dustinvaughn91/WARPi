@@ -13,3 +13,4 @@
 - Added live `kernel` administrative validation identity on WARPi with key-based SSH, locked password, and passwordless sudo.
 - Preserved `kernel-agent` as the constrained read/status identity for future bounded command-surface work.
 - Configured the WiFi Pineapple NANO connection as a sidecar network so WARPi keeps trusted Wi-Fi as its default route.
+- Hardened OpenSSH to key-only access with root SSH disabled, while validating fresh `kernel` admin and `kernel-agent` status connections after reload.

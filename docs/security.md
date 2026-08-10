@@ -13,6 +13,13 @@ Current live model:
 
 The `kernel` account password is locked; access is through the approved public SSH key. The `kernel-agent` account remains useful while WARPi's safer command surface is being designed.
 
+OpenSSH is configured for key-only administrative access:
+
+- `PasswordAuthentication no`
+- `KbdInteractiveAuthentication no`
+- `PermitRootLogin no`
+- `PubkeyAuthentication yes`
+
 Routine K.E.R.N.E.L. interaction should prefer:
 
 - `kernel-report --json`
