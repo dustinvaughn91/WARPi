@@ -14,3 +14,4 @@
 - Preserved `kernel-agent` as the constrained read/status identity for future bounded command-surface work.
 - Configured the WiFi Pineapple NANO connection as a sidecar network so WARPi keeps trusted Wi-Fi as its default route.
 - Hardened OpenSSH to key-only access with root SSH disabled, while validating fresh `kernel` admin and `kernel-agent` status connections after reload.
+- Added the initial `warpi` command dispatcher with an updated help menu and read-only `warpi mode status`; mode switching commands remain intentionally disabled pending transition redesign.

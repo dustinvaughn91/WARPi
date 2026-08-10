@@ -22,6 +22,9 @@ The canonical runtime state is `/run/warpi/state.json`, written by `warpi-kernel
 
 User-facing status is provided by:
 
+- `warpi help`
+- `warpi status`
+- `warpi mode status`
 - `warpi-status`
 - `kernel-report --json`
 - TFT display state/detail files
@@ -33,7 +36,7 @@ WARPi currently has two intended operating modes:
 - `NORMAL`: trusted network client mode.
 - `FIELD`: portable field assessment mode.
 
-Current mode reporting is implemented by `warpi-kernel.service` and supporting modules. Mode transition implementation is under review because legacy mode script references remain in the live system.
+Current mode reporting is implemented by `warpi-kernel.service`, supporting modules, and the `warpi mode status` command. Mode transition implementation is under review because legacy mode script references remain in the live system. `warpi mode enter-field` and `warpi mode return-normal` are not enabled yet.
 
 See [mode-control investigation](mode-control-investigation.md).
 
@@ -58,4 +61,3 @@ flowchart TD
 
     Nano[Optional WiFi Pineapple NANO] -. future optional wireless backend .-> WARPi
 ```
-

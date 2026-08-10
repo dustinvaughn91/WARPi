@@ -11,7 +11,7 @@
 ## P1
 
 - Define the K.E.R.N.E.L./WARPi command contract.
-- Add structured `warpi` command surface if not already present.
+- Extend the structured `warpi` command surface beyond the initial help/menu and read-only mode status.
 - Validate field readiness: cold boot, trusted network, offline behavior, Tailscale reconnect, display status, logs/storage.
 - Review Bettercap service restart warning.
 - Review netplan permission warning.
@@ -28,4 +28,3 @@
 - Generic wireless backend abstraction.
 - Mission job/telemetry workflows.
 - Improved TFT field UX.
-
