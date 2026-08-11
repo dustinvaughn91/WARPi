@@ -1,0 +1,426 @@
+#!/bin/bash
+set -euo pipefail
+
+STATE_FILE="/run/warpi/state.json"
+CONFIG_FILE="/etc/warpi/kernel.conf"
+KERNEL_SERVICE="warpi-kernel.service"
+FIELD_PROFILE="WARPi-Field"
+FIELD_MARKER="/tmp/warpi_fieldmode"
+
+config_value() {
+    local key="$1"
+    local fallback="$2"
+
+    if [[ -r "$CONFIG_FILE" ]]; then
+        awk -F= -v key="$key" '
+            $1 == key {
+                value = $2
+                gsub(/^"/, "", value)
+                gsub(/"$/, "", value)
+                print value
+                found = 1
+                exit
+            }
+            END {
+                if (!found) {
+                    exit 1
+                }
+            }
+        ' "$CONFIG_FILE" 2>/dev/null || printf '%s\n' "$fallback"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+json_value() {
+    local expression="$1"
+    local fallback="${2:-unknown}"
+
+    jq -r "$expression // \"$fallback\"" "$STATE_FILE"
+}
+
+json_bool() {
+    local expression="$1"
+
+    if [[ "$(jq -r "$expression // false" "$STATE_FILE")" == "true" ]]; then
+        echo "YES"
+    else
+        echo "NO"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+
+WARPi command menu
+
+Usage:
+  warpi help
+  warpi status
+  warpi mode status
+  warpi mode enter-field
+  warpi mode return-normal
+  warpi field health
+  warpi field setup
+  warpi report
+  warpi docs audit
+
+Commands:
+  help              Show this menu.
+  status            Show full WARPi K.E.R.N.E.L. status.
+  mode status       Show current NORMAL/FIELD mode state.
+  mode enter-field  Show the Field Mode transition plan without changing state.
+  mode return-normal Show the Normal Mode transition plan without changing state.
+  field health      Show field-mode network and service health.
+  field setup       Prepare field-mode networking/firewall support.
+  report            Emit kernel-report JSON.
+  docs audit        Emit kernel-doc-audit JSON.
+
+Mode switching:
+  enter-field and return-normal are dry-run only. Apply mode is intentionally not enabled yet.
+EOF
+}
+
+require_state() {
+    if [[ ! -r "$STATE_FILE" ]]; then
+        echo "WARPi state is unavailable: $STATE_FILE" >&2
+        systemctl is-active "$KERNEL_SERVICE" 2>/dev/null || true
+        exit 1
+    fi
+}
+
+mode_status() {
+    require_state
+
+    FIELD_PROFILE="$(config_value FIELD_PROFILE "$FIELD_PROFILE")"
+    FIELD_MARKER="$(config_value FIELD_MARKER "$FIELD_MARKER")"
+
+    local mode state reason updated field_mode profile marker_status service_status
+    mode="$(json_value '.mode')"
+    state="$(json_value '.state')"
+    reason="$(json_value '.reason')"
+    updated="$(json_value '.updated')"
+    field_mode="$(json_bool '.network.field_mode')"
+    profile="$(json_value '.network.wifi_profile' 'none')"
+    service_status="$(systemctl is-active "$KERNEL_SERVICE" 2>/dev/null || true)"
+
+    if [[ -e "$FIELD_MARKER" ]]; then
+        marker_status="present"
+    else
+        marker_status="absent"
+    fi
+
+    echo
+    echo "============================================================"
+    echo "                    WARPi MODE"
+    echo "============================================================"
+    echo
+    printf "%-20s %s\n" "Mode:" "$mode"
+    printf "%-20s %s\n" "State:" "$state"
+    printf "%-20s %s\n" "Reason:" "$reason"
+    printf "%-20s %s\n" "Field mode:" "$field_mode"
+    printf "%-20s %s\n" "Active profile:" "$profile"
+    printf "%-20s %s\n" "Field profile:" "$FIELD_PROFILE"
+    printf "%-20s %s\n" "Field marker:" "$marker_status ($FIELD_MARKER)"
+    printf "%-20s %s\n" "KERNEL service:" "$service_status"
+    printf "%-20s %s\n" "Last update:" "$updated"
+    echo
+    echo "============================================================"
+}
+
+mode_enter_field_plan() {
+    require_state
+
+    FIELD_PROFILE="$(config_value FIELD_PROFILE "$FIELD_PROFILE")"
+    FIELD_MARKER="$(config_value FIELD_MARKER "$FIELD_MARKER")"
+
+    local mode state reason field_mode active_profile active_ssid service_status
+    local field_profile_status field_autoconnect field_iface field_wifi_mode
+    local field_ipv4_method field_ipv4_addresses field_ipv6_method marker_status
+    local ssh_status kismet_status tailscale_status
+
+    mode="$(json_value '.mode')"
+    state="$(json_value '.state')"
+    reason="$(json_value '.reason')"
+    field_mode="$(json_bool '.network.field_mode')"
+    active_profile="$(json_value '.network.wifi_profile' 'none')"
+    active_ssid="$(json_value '.network.wifi_ssid' 'none')"
+    service_status="$(systemctl is-active "$KERNEL_SERVICE" 2>/dev/null || true)"
+    ssh_status="$(systemctl is-active ssh.service 2>/dev/null || true)"
+    kismet_status="$(systemctl is-active kismet.service 2>/dev/null || true)"
+    tailscale_status="$(json_bool '.network.tailscale')"
+
+    if nmcli connection show "$FIELD_PROFILE" >/dev/null 2>&1; then
+        field_profile_status="present"
+        field_autoconnect="$(nmcli -g connection.autoconnect connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_iface="$(nmcli -g connection.interface-name connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_wifi_mode="$(nmcli -g 802-11-wireless.mode connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_ipv4_method="$(nmcli -g ipv4.method connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_ipv4_addresses="$(nmcli -g ipv4.addresses connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_ipv6_method="$(nmcli -g ipv6.method connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+    else
+        field_profile_status="missing"
+        field_autoconnect="unknown"
+        field_iface="unknown"
+        field_wifi_mode="unknown"
+        field_ipv4_method="unknown"
+        field_ipv4_addresses="unknown"
+        field_ipv6_method="unknown"
+    fi
+
+    if [[ -e "$FIELD_MARKER" ]]; then
+        marker_status="present"
+    else
+        marker_status="absent"
+    fi
+
+    echo
+    echo "============================================================"
+    echo "              WARPi ENTER FIELD PLAN"
+    echo "============================================================"
+    echo
+    echo "Dry run only. No files, services, routes, radios, or NetworkManager profiles were changed."
+    echo
+    echo "CURRENT STATE"
+    echo "------------------------------------------------------------"
+    printf "%-22s %s\n" "Mode:" "$mode"
+    printf "%-22s %s\n" "State:" "$state"
+    printf "%-22s %s\n" "Reason:" "$reason"
+    printf "%-22s %s\n" "Field mode:" "$field_mode"
+    printf "%-22s %s\n" "Active profile:" "$active_profile"
+    printf "%-22s %s\n" "Active SSID:" "$active_ssid"
+    printf "%-22s %s\n" "KERNEL service:" "$service_status"
+    printf "%-22s %s\n" "SSH service:" "$ssh_status"
+    printf "%-22s %s\n" "Kismet service:" "$kismet_status"
+    printf "%-22s %s\n" "Tailscale connected:" "$tailscale_status"
+    echo
+    echo "FIELD PROFILE"
+    echo "------------------------------------------------------------"
+    printf "%-22s %s\n" "Name:" "$FIELD_PROFILE"
+    printf "%-22s %s\n" "Status:" "$field_profile_status"
+    printf "%-22s %s\n" "Interface:" "$field_iface"
+    printf "%-22s %s\n" "Autoconnect:" "$field_autoconnect"
+    printf "%-22s %s\n" "Wi-Fi mode:" "$field_wifi_mode"
+    printf "%-22s %s\n" "IPv4 method:" "$field_ipv4_method"
+    printf "%-22s %s\n" "IPv4 address:" "$field_ipv4_addresses"
+    printf "%-22s %s\n" "IPv6 method:" "$field_ipv6_method"
+    printf "%-22s %s\n" "Field marker:" "$marker_status ($FIELD_MARKER)"
+    echo
+    echo "PROPOSED APPLY SEQUENCE"
+    echo "------------------------------------------------------------"
+    echo "1. Confirm local/console recovery and authorized field profile."
+    echo "2. Run field preparation checks for NetworkManager, SSH, IPv4 forwarding, and firewall rules."
+    echo "3. Bring up NetworkManager profile: $FIELD_PROFILE."
+    echo "4. Create field marker: $FIELD_MARKER."
+    echo "5. Start or validate field services such as SSH and Kismet."
+    echo "6. Wait for /run/warpi/state.json to report FIELD or a clear degraded state."
+    echo "7. Verify operator access path before considering the transition complete."
+    echo
+    echo "ROLLBACK EXPECTATION"
+    echo "------------------------------------------------------------"
+    echo "A future return-normal command should bring trusted Wi-Fi back up, remove the field marker, stop field-only services when appropriate, and verify NORMAL/CONNECTED or a clear degraded state."
+    echo
+    echo "NEXT ENABLEMENT GATE"
+    echo "------------------------------------------------------------"
+    echo "Implement apply mode only after this plan matches the real field workflow and recovery path."
+    echo
+    echo "============================================================"
+}
+
+mode_return_normal_plan() {
+    require_state
+
+    FIELD_PROFILE="$(config_value FIELD_PROFILE "$FIELD_PROFILE")"
+    FIELD_MARKER="$(config_value FIELD_MARKER "$FIELD_MARKER")"
+
+    local mode state reason field_mode active_profile active_ssid service_status
+    local field_profile_status field_autoconnect field_iface field_wifi_mode
+    local field_ipv4_method field_ipv4_addresses field_ipv6_method marker_status
+    local ssh_status kismet_status tailscale_status
+
+    mode="$(json_value '.mode')"
+    state="$(json_value '.state')"
+    reason="$(json_value '.reason')"
+    field_mode="$(json_bool '.network.field_mode')"
+    active_profile="$(json_value '.network.wifi_profile' 'none')"
+    active_ssid="$(json_value '.network.wifi_ssid' 'none')"
+    service_status="$(systemctl is-active "$KERNEL_SERVICE" 2>/dev/null || true)"
+    ssh_status="$(systemctl is-active ssh.service 2>/dev/null || true)"
+    kismet_status="$(systemctl is-active kismet.service 2>/dev/null || true)"
+    tailscale_status="$(json_bool '.network.tailscale')"
+
+    if nmcli connection show "$FIELD_PROFILE" >/dev/null 2>&1; then
+        field_profile_status="present"
+        field_autoconnect="$(nmcli -g connection.autoconnect connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_iface="$(nmcli -g connection.interface-name connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_wifi_mode="$(nmcli -g 802-11-wireless.mode connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_ipv4_method="$(nmcli -g ipv4.method connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_ipv4_addresses="$(nmcli -g ipv4.addresses connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+        field_ipv6_method="$(nmcli -g ipv6.method connection show "$FIELD_PROFILE" 2>/dev/null || echo unknown)"
+    else
+        field_profile_status="missing"
+        field_autoconnect="unknown"
+        field_iface="unknown"
+        field_wifi_mode="unknown"
+        field_ipv4_method="unknown"
+        field_ipv4_addresses="unknown"
+        field_ipv6_method="unknown"
+    fi
+
+    if [[ -e "$FIELD_MARKER" ]]; then
+        marker_status="present"
+    else
+        marker_status="absent"
+    fi
+
+    echo
+    echo "============================================================"
+    echo "             WARPi RETURN NORMAL PLAN"
+    echo "============================================================"
+    echo
+    echo "Dry run only. No files, services, routes, radios, or NetworkManager profiles were changed."
+    echo
+    echo "CURRENT STATE"
+    echo "------------------------------------------------------------"
+    printf "%-22s %s\n" "Mode:" "$mode"
+    printf "%-22s %s\n" "State:" "$state"
+    printf "%-22s %s\n" "Reason:" "$reason"
+    printf "%-22s %s\n" "Field mode:" "$field_mode"
+    printf "%-22s %s\n" "Active profile:" "$active_profile"
+    printf "%-22s %s\n" "Active SSID:" "$active_ssid"
+    printf "%-22s %s\n" "KERNEL service:" "$service_status"
+    printf "%-22s %s\n" "SSH service:" "$ssh_status"
+    printf "%-22s %s\n" "Kismet service:" "$kismet_status"
+    printf "%-22s %s\n" "Tailscale connected:" "$tailscale_status"
+    echo
+    echo "FIELD PROFILE"
+    echo "------------------------------------------------------------"
+    printf "%-22s %s\n" "Name:" "$FIELD_PROFILE"
+    printf "%-22s %s\n" "Status:" "$field_profile_status"
+    printf "%-22s %s\n" "Interface:" "$field_iface"
+    printf "%-22s %s\n" "Autoconnect:" "$field_autoconnect"
+    printf "%-22s %s\n" "Wi-Fi mode:" "$field_wifi_mode"
+    printf "%-22s %s\n" "IPv4 method:" "$field_ipv4_method"
+    printf "%-22s %s\n" "IPv4 address:" "$field_ipv4_addresses"
+    printf "%-22s %s\n" "IPv6 method:" "$field_ipv6_method"
+    printf "%-22s %s\n" "Field marker:" "$marker_status ($FIELD_MARKER)"
+    echo
+    echo "PROPOSED RETURN SEQUENCE"
+    echo "------------------------------------------------------------"
+    echo "1. Confirm local/console recovery and trusted network credentials."
+    echo "2. Stop or validate field-only services according to the approved recovery plan."
+    echo "3. Bring trusted client networking back up before removing the field access path."
+    echo "4. Remove field marker if present: $FIELD_MARKER."
+    echo "5. Ensure NetworkManager profile $FIELD_PROFILE is not left autoconnecting."
+    echo "6. Wait for /run/warpi/state.json to report NORMAL/CONNECTED or a clear degraded state."
+    echo "7. Verify operator access path before considering the return complete."
+    echo
+    echo "NEXT ENABLEMENT GATE"
+    echo "------------------------------------------------------------"
+    echo "Implement apply mode only after this return workflow and recovery path are validated."
+    echo
+    echo "============================================================"
+}
+
+case "${1:-help}" in
+    help|-h|--help)
+        usage
+        ;;
+    status)
+        exec warpi-status
+        ;;
+    mode)
+        case "${2:-status}" in
+            status)
+                mode_status
+                ;;
+            enter-field)
+                case "${3:-}" in
+                    ""|--plan|--dry-run)
+                        mode_enter_field_plan
+                        ;;
+                    --apply)
+                        echo "warpi mode enter-field --apply is not enabled yet; dry-run only." >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Unknown enter-field option: $3" >&2
+                        echo "Try: warpi mode enter-field" >&2
+                        exit 2
+                        ;;
+                esac
+                ;;
+            help|-h|--help)
+                usage
+                ;;
+            return-normal)
+                case "${3:-}" in
+                    ""|--plan|--dry-run)
+                        mode_return_normal_plan
+                        ;;
+                    --apply)
+                        echo "warpi mode return-normal --apply is not enabled yet; dry-run only." >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Unknown return-normal option: $3" >&2
+                        echo "Try: warpi mode return-normal" >&2
+                        exit 2
+                        ;;
+                esac
+                ;;
+            *)
+                echo "Unknown mode command: ${2:-}" >&2
+                echo "Try: warpi mode status" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    field)
+        case "${2:-health}" in
+            health)
+                exec warpi-field-health
+                ;;
+            setup)
+                if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+                    exec sudo -n warpi-field-setup
+                fi
+                exec warpi-field-setup
+                ;;
+            help|-h|--help)
+                usage
+                ;;
+            *)
+                echo "Unknown field command: ${2:-}" >&2
+                echo "Try: warpi field health" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    report)
+        exec kernel-report --json
+        ;;
+    docs)
+        case "${2:-audit}" in
+            audit)
+                if [[ ! -r /opt/warpi/docs ]] && sudo -n true 2>/dev/null; then
+                    exec sudo -n kernel-doc-audit --json
+                fi
+                exec kernel-doc-audit --json
+                ;;
+            help|-h|--help)
+                usage
+                ;;
+            *)
+                echo "Unknown docs command: ${2:-}" >&2
+                echo "Try: warpi docs audit" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    *)
+        echo "Unknown command: ${1:-}" >&2
+        echo "Try: warpi help" >&2
+        exit 2
+        ;;
+esac

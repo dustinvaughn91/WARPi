@@ -31,6 +31,8 @@ User-facing status is provided by:
 - `kernel-report --json`
 - TFT display state/detail files
 
+The maintained dispatcher source is tracked at `bin/warpi`. The live deployed artifact is `/usr/local/bin/warpi` on WARPi and should be updated from the tracked source after validation, not edited as an undocumented source of truth.
+
 ## Mode Model
 
 WARPi currently has two intended operating modes:

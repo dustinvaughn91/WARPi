@@ -20,3 +20,4 @@
 ## 2026-08-11
 
 - Added and validated dry-run `warpi mode return-normal` planning output alongside the existing Field Mode planner; apply mode remains disabled.
+- Added `bin/warpi` as the canonical tracked source for the deployed `/usr/local/bin/warpi` dispatcher and validated the live deployment without performing a real mode transition.

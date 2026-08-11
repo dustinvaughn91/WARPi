@@ -51,3 +51,5 @@ Preferred future direction:
 ## Current Command Surface
 
 As of 2026-08-11, `warpi mode enter-field` and `warpi mode return-normal` are dry-run planners only. They are intended to describe the transition and recovery expectations without changing live networking, services, routes, radios, marker files, or NetworkManager profiles. Apply mode remains gated until the real workflow and rollback path are approved.
+
+The dispatcher source is now tracked in the WARPi repository at `bin/warpi`; the live `/usr/local/bin/warpi` file is the deployed artifact. Future dispatcher changes should be made against `bin/warpi`, validated, then deployed intentionally.
