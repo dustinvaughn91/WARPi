@@ -24,3 +24,4 @@
 - Added `bin/kernel-report` and `bin/kernel-doc-audit` as tracked sources for the deployed reporting tools.
 - Migrated active reporting and audit expectations away from obsolete user-home `fieldmode` / `normalmode` scripts to the maintained `warpi mode` dispatcher surface.
 - Validated that `kernel-report` reports the dispatcher, both dry-run planners, and the gated apply workflow; validated that `kernel-doc-audit` no longer treats missing legacy user-home scripts as current requirements.
+- Documented the live documentation source-of-truth model, added `bin/warpi-docs-sync`, and taught `kernel-doc-audit` to validate the deployed documentation manifest under `/opt/warpi/docs`.

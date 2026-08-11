@@ -33,6 +33,8 @@ User-facing status is provided by:
 
 The maintained dispatcher source is tracked at `bin/warpi`. The live deployed artifact is `/usr/local/bin/warpi` on WARPi and should be updated from the tracked source after validation, not edited as an undocumented source of truth. Reporting and audit tool sources are tracked at `bin/kernel-report` and `bin/kernel-doc-audit`, with live deployed artifacts at `/usr/local/bin/kernel-report` and `/usr/local/bin/kernel-doc-audit`.
 
+The canonical documentation source is the tracked repository `docs/` tree. The live `/opt/warpi/docs` directory is a deployed copy for on-device visibility and audit. It is populated with `bin/warpi-docs-sync`, which writes `.warpi-docs-manifest.sha256`; `kernel-doc-audit` validates that manifest to detect live documentation drift. See [live documentation](live-documentation.md).
+
 ## Mode Model
 
 WARPi currently has two intended operating modes:

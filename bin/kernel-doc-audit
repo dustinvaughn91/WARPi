@@ -3,6 +3,7 @@ set -euo pipefail
 
 MODE="${1:---json}"
 DOC_ROOT="/opt/warpi/docs"
+DOC_MANIFEST="$DOC_ROOT/.warpi-docs-manifest.sha256"
 
 validate_python() {
     local path="$1"
@@ -165,6 +166,7 @@ collect_files() {
     json_file "/usr/local/bin/warpi-field-health" "operator-tool"
     json_file "/usr/local/bin/kernel-report" "agent-tool"
     json_file "/usr/local/bin/kernel-doc-audit" "agent-tool"
+    json_file "/usr/local/bin/warpi-docs-sync" "agent-tool"
 
     json_file "/etc/warpi/kernel.conf" "configuration"
     json_file "/etc/kismet/kismet_site.conf" "configuration"
@@ -240,10 +242,43 @@ documentation_json="$(
     fi
 )"
 
+manifest_json="$(
+    if [[ -f "$DOC_MANIFEST" && -r "$DOC_MANIFEST" ]]; then
+        if (
+            cd "$DOC_ROOT" &&
+                sha256sum -c "$(basename "$DOC_MANIFEST")" >/dev/null 2>&1
+        ); then
+            status="passed"
+        else
+            status="failed"
+        fi
+
+        jq -n \
+            --arg path "$DOC_MANIFEST" \
+            --arg status "$status" \
+            '{
+                path: $path,
+                exists: true,
+                readable: true,
+                validation: $status
+            }'
+    else
+        jq -n \
+            --arg path "$DOC_MANIFEST" \
+            '{
+                path: $path,
+                exists: false,
+                readable: false,
+                validation: "missing"
+            }'
+    fi
+)"
+
 gaps_json="$(
     jq -n \
         --argjson files "$files_json" \
         --argjson docs "$documentation_json" \
+        --argjson manifest "$manifest_json" \
         '
         [
             if ($docs | length) == 0 then
@@ -251,6 +286,22 @@ gaps_json="$(
                     severity: "high",
                     id: "documentation-directory-empty",
                     message: "No WARPi documentation files were found under /opt/warpi/docs."
+                }
+            else empty end,
+
+            if $manifest.exists == false then
+                {
+                    severity: "high",
+                    id: "documentation-manifest-missing",
+                    message: "The live WARPi documentation manifest is missing from /opt/warpi/docs."
+                }
+            else empty end,
+
+            if $manifest.validation == "failed" then
+                {
+                    severity: "high",
+                    id: "documentation-manifest-drift",
+                    message: "Live WARPi documentation does not match its deployed manifest."
                 }
             else empty end,
 
@@ -324,6 +375,7 @@ report="$(
         --argjson files "$files_json" \
         --argjson services "$services_json" \
         --argjson docs "$documentation_json" \
+        --argjson manifest "$manifest_json" \
         --argjson gaps "$gaps_json" \
         '{
             schema_version: 1,
@@ -334,6 +386,7 @@ report="$(
             files: $files,
             documentation: {
                 root: "/opt/warpi/docs",
+                manifest: $manifest,
                 files: $docs,
                 count: ($docs | length)
             },
