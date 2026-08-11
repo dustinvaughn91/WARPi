@@ -16,3 +16,7 @@
 - Hardened OpenSSH to key-only access with root SSH disabled, while validating fresh `kernel` admin and `kernel-agent` status connections after reload.
 - Added the initial `warpi` command dispatcher with an updated help menu and read-only `warpi mode status`; mode switching commands remain intentionally disabled pending transition redesign.
 - Added dry-run `warpi mode enter-field` planning output that reports current state, Field profile settings, proposed apply sequence, rollback expectation, and next enablement gate without changing live networking or mode state.
+
+## 2026-08-11
+
+- Added and validated dry-run `warpi mode return-normal` planning output alongside the existing Field Mode planner; apply mode remains disabled.

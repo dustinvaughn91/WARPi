@@ -43,8 +43,11 @@ Do not recreate the old scripts as-is.
 
 Preferred future direction:
 
-- create a maintained mode-control surface such as `warpi mode status`, `warpi mode enter-field`, and `warpi mode return-normal`
+- continue the maintained mode-control surface through `warpi mode status`, `warpi mode enter-field`, and `warpi mode return-normal`
 - move script references away from user-home paths
 - update `kernel.py`, `kernel-report`, and `kernel-doc-audit` to track the new truth
 - document the approved command surface before enabling automated transitions
 
+## Current Command Surface
+
+As of 2026-08-11, `warpi mode enter-field` and `warpi mode return-normal` are dry-run planners only. They are intended to describe the transition and recovery expectations without changing live networking, services, routes, radios, marker files, or NetworkManager profiles. Apply mode remains gated until the real workflow and rollback path are approved.
