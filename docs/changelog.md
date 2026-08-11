@@ -21,3 +21,6 @@
 
 - Added and validated dry-run `warpi mode return-normal` planning output alongside the existing Field Mode planner; apply mode remains disabled.
 - Added `bin/warpi` as the canonical tracked source for the deployed `/usr/local/bin/warpi` dispatcher and validated the live deployment without performing a real mode transition.
+- Added `bin/kernel-report` and `bin/kernel-doc-audit` as tracked sources for the deployed reporting tools.
+- Migrated active reporting and audit expectations away from obsolete user-home `fieldmode` / `normalmode` scripts to the maintained `warpi mode` dispatcher surface.
+- Validated that `kernel-report` reports the dispatcher, both dry-run planners, and the gated apply workflow; validated that `kernel-doc-audit` no longer treats missing legacy user-home scripts as current requirements.

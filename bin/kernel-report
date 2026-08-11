@@ -1,0 +1,260 @@
+#!/bin/bash
+set -euo pipefail
+
+STATE_FILE="/run/warpi/state.json"
+MODE="${1:-pretty}"
+
+json_bool() {
+    if "$@" >/dev/null 2>&1; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+service_state() {
+    systemctl is-active "$1" 2>/dev/null || true
+}
+
+service_enabled() {
+    systemctl is-enabled "$1" 2>/dev/null || true
+}
+
+file_meta_json() {
+    local path="$1"
+
+    if [[ -e "$path" ]]; then
+        stat \
+            --printf='{"path":"%n","exists":true,"owner":"%U","group":"%G","mode":"%a","size":%s,"modified":"%y"}' \
+            "$path" |
+            sed 's/"}$/"}'/
+    else
+        jq -n \
+            --arg path "$path" \
+            '{
+                path: $path,
+                exists: false,
+                owner: null,
+                group: null,
+                mode: null,
+                size: null,
+                modified: null
+            }'
+    fi
+}
+
+load_json="$(cat /proc/loadavg 2>/dev/null | awk '{print $1","$2","$3}' || echo "0,0,0")"
+IFS=',' read -r load1 load5 load15 <<<"$load_json"
+
+memory_json="$(
+    free -b | awk '
+        /Mem:/ {
+            printf "{\"total\":%s,\"used\":%s,\"free\":%s,\"available\":%s}",
+                $2, $3, $4, $7
+        }
+    '
+)"
+
+disk_json="$(
+    df -B1 / | awk '
+        NR == 2 {
+            printf "{\"filesystem\":\"%s\",\"total\":%s,\"used\":%s,\"available\":%s,\"percent\":\"%s\"}",
+                $1, $2, $3, $4, $5
+        }
+    '
+)"
+
+temperature="null"
+
+if [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
+    raw_temp="$(cat /sys/class/thermal/thermal_zone0/temp)"
+    temperature="$(awk -v value="$raw_temp" 'BEGIN { printf "%.1f", value / 1000 }')"
+fi
+
+kernel_state='{}'
+
+if [[ -r "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
+    kernel_state="$(cat "$STATE_FILE")"
+fi
+
+recent_warnings="$(
+    journalctl \
+        --since "24 hours ago" \
+        --priority warning \
+        --no-pager \
+        --output json 2>/dev/null |
+        jq -s '
+            map({
+                timestamp: .__REALTIME_TIMESTAMP,
+                unit: (._SYSTEMD_UNIT // .SYSLOG_IDENTIFIER // "unknown"),
+                message: (.MESSAGE // "")
+            })
+            | .[-50:]
+        '
+)"
+
+[[ -n "$recent_warnings" ]] || recent_warnings='[]'
+
+report="$(
+    jq -n \
+        --arg generated "$(date --iso-8601=seconds)" \
+        --arg hostname "$(hostname)" \
+        --arg os "$(source /etc/os-release && printf '%s' "$PRETTY_NAME")" \
+        --arg kernel "$(uname -r)" \
+        --arg architecture "$(uname -m)" \
+        --arg uptime "$(uptime -p 2>/dev/null || echo unknown)" \
+        --arg load1 "$load1" \
+        --arg load5 "$load5" \
+        --arg load15 "$load15" \
+        --argjson temperature "$temperature" \
+        --argjson memory "$memory_json" \
+        --argjson disk "$disk_json" \
+        --argjson state "$kernel_state" \
+        --argjson warnings "$recent_warnings" \
+        --arg kernel_service "$(service_state warpi-kernel.service)" \
+        --arg kernel_enabled "$(service_enabled warpi-kernel.service)" \
+        --arg kismet_service "$(service_state kismet.service)" \
+        --arg kismet_enabled "$(service_enabled kismet.service)" \
+        --arg ssh_service "$(service_state ssh.service)" \
+        --arg ssh_enabled "$(service_enabled ssh.service)" \
+        --arg tailscale_service "$(service_state tailscaled.service)" \
+        --arg tailscale_enabled "$(service_enabled tailscaled.service)" \
+        --arg networkmanager_service "$(service_state NetworkManager.service)" \
+        --arg networkmanager_enabled "$(service_enabled NetworkManager.service)" \
+        --arg gpsd_service "$(service_state gpsd.service)" \
+        --arg gpsd_enabled "$(service_enabled gpsd.service)" \
+        --arg warpi_dispatcher "/usr/local/bin/warpi" \
+        --arg enter_field_planner "warpi mode enter-field" \
+        --arg return_normal_planner "warpi mode return-normal" \
+        --arg apply_workflow "gated" \
+        --arg kernelconf "/etc/warpi/kernel.conf" \
+        --arg kernelpy "/opt/warpi/kernel.py" \
+        --arg kismetsite "/etc/kismet/kismet_site.conf" \
+        '
+        {
+            schema_version: 1,
+            generated: $generated,
+            system: {
+                hostname: $hostname,
+                os: $os,
+                kernel: $kernel,
+                architecture: $architecture,
+                uptime: $uptime,
+                load: {
+                    one_minute: ($load1 | tonumber),
+                    five_minutes: ($load5 | tonumber),
+                    fifteen_minutes: ($load15 | tonumber)
+                },
+                temperature_celsius: $temperature,
+                memory: $memory,
+                root_disk: $disk
+            },
+            kernel_state: $state,
+            services: {
+                warpi_kernel: {
+                    active: $kernel_service,
+                    enabled: $kernel_enabled
+                },
+                networkmanager: {
+                    active: $networkmanager_service,
+                    enabled: $networkmanager_enabled
+                },
+                ssh: {
+                    active: $ssh_service,
+                    enabled: $ssh_enabled
+                },
+                tailscale: {
+                    active: $tailscale_service,
+                    enabled: $tailscale_enabled
+                },
+                gpsd: {
+                    active: $gpsd_service,
+                    enabled: $gpsd_enabled
+                },
+                kismet: {
+                    active: $kismet_service,
+                    enabled: $kismet_enabled
+                }
+            },
+            mode_control: {
+                dispatcher: $warpi_dispatcher,
+                enter_field_planner: $enter_field_planner,
+                return_normal_planner: $return_normal_planner,
+                apply_workflow: $apply_workflow
+            },
+            important_files: [
+                $warpi_dispatcher,
+                $kernelconf,
+                $kernelpy,
+                $kismetsite
+            ],
+            recent_warnings: $warnings
+        }
+        '
+)"
+
+case "$MODE" in
+    --json|json)
+        printf '%s\n' "$report" | jq .
+        ;;
+    --compact)
+        printf '%s\n' "$report" | jq -c .
+        ;;
+    pretty|"")
+        printf '%s\n' "$report" | jq -r '
+            "
+============================================================
+                 WARPi K.E.R.N.E.L. REPORT
+============================================================
+
+SYSTEM
+------------------------------------------------------------
+Hostname:             \(.system.hostname)
+OS:                   \(.system.os)
+Kernel:               \(.system.kernel)
+Architecture:         \(.system.architecture)
+Uptime:               \(.system.uptime)
+Temperature:          \(.system.temperature_celsius // "unavailable") C
+Load:                 \(.system.load.one_minute) / \(.system.load.five_minutes) / \(.system.load.fifteen_minutes)
+Memory available:     \(.system.memory.available)
+Root disk used:       \(.system.root_disk.percent)
+
+SERVICES
+------------------------------------------------------------
+KERNEL:               \(.services.warpi_kernel.active) / \(.services.warpi_kernel.enabled)
+NetworkManager:       \(.services.networkmanager.active) / \(.services.networkmanager.enabled)
+SSH:                  \(.services.ssh.active) / \(.services.ssh.enabled)
+Tailscale:            \(.services.tailscale.active) / \(.services.tailscale.enabled)
+GPSD:                 \(.services.gpsd.active) / \(.services.gpsd.enabled)
+Kismet:               \(.services.kismet.active) / \(.services.kismet.enabled)
+
+WARPi STATE
+------------------------------------------------------------
+Mode:                 \(.kernel_state.mode // "unknown")
+State:                \(.kernel_state.state // "unknown")
+Reason:               \(.kernel_state.reason // "unknown")
+Wi-Fi:                \(.kernel_state.network.wifi_ssid // "none")
+IPv4:                 \(.kernel_state.network.ipv4 // "none")
+Tailscale IP:         \(.kernel_state.network.tailscale_ip // "none")
+Mission:              \(.kernel_state.mission.status // "unknown")
+GPS:                  \(.kernel_state.gps.status // "unknown")
+Kismet expected:      \(
+    if .kernel_state.mode == "FIELD"
+    then "running"
+    else "stopped"
+    end
+)
+
+WARNINGS
+------------------------------------------------------------
+Recent warning count: \(.recent_warnings | length)
+
+============================================================
+"
+        '
+        ;;
+    *)
+        echo "Usage: kernel-report [--json|--compact]" >&2
+        exit 2
+        ;;
+esac

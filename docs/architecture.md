@@ -31,7 +31,7 @@ User-facing status is provided by:
 - `kernel-report --json`
 - TFT display state/detail files
 
-The maintained dispatcher source is tracked at `bin/warpi`. The live deployed artifact is `/usr/local/bin/warpi` on WARPi and should be updated from the tracked source after validation, not edited as an undocumented source of truth.
+The maintained dispatcher source is tracked at `bin/warpi`. The live deployed artifact is `/usr/local/bin/warpi` on WARPi and should be updated from the tracked source after validation, not edited as an undocumented source of truth. Reporting and audit tool sources are tracked at `bin/kernel-report` and `bin/kernel-doc-audit`, with live deployed artifacts at `/usr/local/bin/kernel-report` and `/usr/local/bin/kernel-doc-audit`.
 
 ## Mode Model
 
@@ -40,7 +40,7 @@ WARPi currently has two intended operating modes:
 - `NORMAL`: trusted network client mode.
 - `FIELD`: portable field assessment mode.
 
-Current mode reporting is implemented by `warpi-kernel.service`, supporting modules, and the `warpi mode status` command. `warpi mode enter-field` and `warpi mode return-normal` currently render dry-run transition plans only; they do not change files, services, routes, radios, or NetworkManager profiles. Mode transition implementation is under review because legacy mode script references remain in the live system. `warpi mode enter-field --apply` and `warpi mode return-normal --apply` are not enabled yet.
+Current mode reporting is implemented by `warpi-kernel.service`, supporting modules, and the `warpi mode status` command. `kernel-report` and `kernel-doc-audit` report the maintained dispatcher and dry-run planners as the current mode-control surface. `warpi mode enter-field` and `warpi mode return-normal` currently render dry-run transition plans only; they do not change files, services, routes, radios, or NetworkManager profiles. Real mode transition implementation remains gated because the apply workflow and rollback path are not approved yet. `warpi mode enter-field --apply` and `warpi mode return-normal --apply` are not enabled yet.
 
 See [mode-control investigation](mode-control-investigation.md).
 

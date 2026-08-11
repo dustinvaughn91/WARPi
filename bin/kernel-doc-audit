@@ -1,0 +1,436 @@
+#!/bin/bash
+set -euo pipefail
+
+MODE="${1:---json}"
+DOC_ROOT="/opt/warpi/docs"
+
+validate_python() {
+    local path="$1"
+
+    python3 - "$path" <<'PY' >/dev/null 2>&1
+import ast
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+ast.parse(source, filename=str(path))
+PY
+}
+
+validate_file() {
+    local path="$1"
+
+    case "$path" in
+        *.py)
+            if validate_python "$path"; then
+                printf 'passed'
+            else
+                printf 'failed'
+            fi
+            ;;
+
+        *.sh|*/fieldmode|*/normalmode|*/normalmode-worker|*/warpi|*/warpi-*|*/kernel-report|*/kernel-doc-audit|*/kernel)
+            if bash -n "$path" >/dev/null 2>&1; then
+                printf 'passed'
+            else
+                printf 'failed'
+            fi
+            ;;
+
+        *.service)
+            if systemd-analyze verify "$path" >/dev/null 2>&1; then
+                printf 'passed'
+            else
+                printf 'failed'
+            fi
+            ;;
+
+        *)
+            printf 'not-applicable'
+            ;;
+    esac
+}
+
+json_file() {
+    local path="$1"
+    local category="$2"
+
+    if [[ ! -e "$path" ]]; then
+        jq -n \
+            --arg path "$path" \
+            --arg category "$category" \
+            '{
+                path: $path,
+                category: $category,
+                exists: false,
+                readable: false,
+                type: null,
+                owner: null,
+                group: null,
+                mode: null,
+                size: null,
+                modified: null,
+                sha256: null,
+                executable: false,
+                syntax_check: null
+            }'
+        return
+    fi
+
+    local type
+    local owner
+    local group
+    local permissions
+    local size
+    local modified
+    local sha256=""
+    local readable="false"
+    local executable="false"
+    local syntax_check="not-applicable"
+
+    type="$(stat -c '%F' "$path")"
+    owner="$(stat -c '%U' "$path")"
+    group="$(stat -c '%G' "$path")"
+    permissions="$(stat -c '%a' "$path")"
+    size="$(stat -c '%s' "$path")"
+    modified="$(stat -c '%y' "$path")"
+
+    if [[ -r "$path" ]]; then
+        readable="true"
+
+        if [[ -f "$path" ]]; then
+            sha256="$(sha256sum "$path" 2>/dev/null | awk '{print $1}')"
+        fi
+
+        syntax_check="$(validate_file "$path")"
+    else
+        syntax_check="not-readable"
+    fi
+
+    if [[ -x "$path" ]]; then
+        executable="true"
+    fi
+
+    jq -n \
+        --arg path "$path" \
+        --arg category "$category" \
+        --arg type "$type" \
+        --arg owner "$owner" \
+        --arg group "$group" \
+        --arg mode "$permissions" \
+        --argjson size "$size" \
+        --arg modified "$modified" \
+        --arg sha256 "$sha256" \
+        --argjson readable "$readable" \
+        --argjson executable "$executable" \
+        --arg syntax_check "$syntax_check" \
+        '{
+            path: $path,
+            category: $category,
+            exists: true,
+            readable: $readable,
+            type: $type,
+            owner: $owner,
+            group: $group,
+            mode: $mode,
+            size: $size,
+            modified: $modified,
+            sha256: (
+                if $sha256 == ""
+                then null
+                else $sha256
+                end
+            ),
+            executable: $executable,
+            syntax_check: $syntax_check
+        }'
+}
+
+collect_files() {
+    json_file "/opt/warpi/kernel.py" "kernel"
+    json_file "/opt/warpi/utils/config.py" "kernel"
+    json_file "/opt/warpi/utils/command.py" "kernel"
+
+    json_file "/opt/warpi/modules/network.py" "collector"
+    json_file "/opt/warpi/modules/mission.py" "collector"
+    json_file "/opt/warpi/modules/gps.py" "collector"
+    json_file "/opt/warpi/modules/power.py" "collector"
+    json_file "/opt/warpi/modules/display.py" "collector"
+
+    json_file "/usr/local/bin/kernel" "launcher"
+    json_file "/usr/local/bin/warpi" "operator-tool"
+    json_file "/usr/local/bin/warpi-status" "operator-tool"
+    json_file "/usr/local/bin/warpi-field-setup" "operator-tool"
+    json_file "/usr/local/bin/warpi-field-health" "operator-tool"
+    json_file "/usr/local/bin/kernel-report" "agent-tool"
+    json_file "/usr/local/bin/kernel-doc-audit" "agent-tool"
+
+    json_file "/etc/warpi/kernel.conf" "configuration"
+    json_file "/etc/kismet/kismet_site.conf" "configuration"
+
+    json_file "/etc/systemd/system/warpi-kernel.service" "systemd"
+    json_file "/etc/sudoers.d/kernel-agent" "authorization"
+
+    if [[ -d "$DOC_ROOT" && -r "$DOC_ROOT" && -x "$DOC_ROOT" ]]; then
+        while IFS= read -r path; do
+            json_file "$path" "documentation"
+        done < <(
+            {
+                find "$DOC_ROOT" \
+                    -maxdepth 3 \
+                    -type f \
+                    -print 2>/dev/null || true
+            } |
+                sort
+        )
+    fi
+}
+
+files_json="$(
+    collect_files |
+        jq -s '.'
+)"
+
+services_json="$(
+    jq -n \
+        --arg kernel_active "$(systemctl is-active warpi-kernel.service 2>/dev/null || true)" \
+        --arg kernel_enabled "$(systemctl is-enabled warpi-kernel.service 2>/dev/null || true)" \
+        --arg kismet_active "$(systemctl is-active kismet.service 2>/dev/null || true)" \
+        --arg kismet_enabled "$(systemctl is-enabled kismet.service 2>/dev/null || true)" \
+        --arg tailscale_active "$(systemctl is-active tailscaled.service 2>/dev/null || true)" \
+        --arg tailscale_enabled "$(systemctl is-enabled tailscaled.service 2>/dev/null || true)" \
+        --arg ssh_active "$(systemctl is-active ssh.service 2>/dev/null || true)" \
+        --arg ssh_enabled "$(systemctl is-enabled ssh.service 2>/dev/null || true)" \
+        '{
+            warpi_kernel: {
+                active: $kernel_active,
+                enabled: $kernel_enabled
+            },
+            kismet: {
+                active: $kismet_active,
+                enabled: $kismet_enabled
+            },
+            tailscale: {
+                active: $tailscale_active,
+                enabled: $tailscale_enabled
+            },
+            ssh: {
+                active: $ssh_active,
+                enabled: $ssh_enabled
+            }
+        }'
+)"
+
+documentation_json="$(
+    if [[ -d "$DOC_ROOT" && -r "$DOC_ROOT" && -x "$DOC_ROOT" ]]; then
+        {
+            find "$DOC_ROOT" \
+                -maxdepth 3 \
+                -type f \
+                -printf '%p\n' 2>/dev/null || true
+        } |
+            sort |
+            jq -R -s '
+                split("\n")
+                | map(select(length > 0))
+            '
+    else
+        printf '[]\n'
+    fi
+)"
+
+gaps_json="$(
+    jq -n \
+        --argjson files "$files_json" \
+        --argjson docs "$documentation_json" \
+        '
+        [
+            if ($docs | length) == 0 then
+                {
+                    severity: "high",
+                    id: "documentation-directory-empty",
+                    message: "No WARPi documentation files were found under /opt/warpi/docs."
+                }
+            else empty end,
+
+            if (
+                $files
+                | map(select(.exists == false))
+                | length
+            ) > 0 then
+                {
+                    severity: "high",
+                    id: "missing-important-files",
+                    message: "One or more important WARPi files are missing."
+                }
+            else empty end,
+
+            if (
+                $files
+                | map(select(.syntax_check == "failed"))
+                | length
+            ) > 0 then
+                {
+                    severity: "critical",
+                    id: "syntax-check-failure",
+                    message: "One or more managed WARPi files failed validation."
+                }
+            else empty end,
+
+            if (
+                $files
+                | map(
+                    select(
+                        .category == "mode-script"
+                        and .exists == true
+                        and .executable == false
+                    )
+                )
+                | length
+            ) > 0 then
+                {
+                    severity: "high",
+                    id: "mode-script-not-executable",
+                    message: "A Field or Normal Mode script is not executable."
+                }
+            else empty end,
+
+            if (
+                $files
+                | map(
+                    select(
+                        .category == "authorization"
+                        and .mode != "440"
+                    )
+                )
+                | length
+            ) > 0 then
+                {
+                    severity: "high",
+                    id: "sudoers-permission",
+                    message: "The kernel-agent sudoers file is not mode 440."
+                }
+            else empty end
+        ]
+        '
+)"
+
+report="$(
+    jq -n \
+        --arg generated "$(date --iso-8601=seconds)" \
+        --arg hostname "$(hostname)" \
+        --arg audit_user "$(id -un)" \
+        --argjson files "$files_json" \
+        --argjson services "$services_json" \
+        --argjson docs "$documentation_json" \
+        --argjson gaps "$gaps_json" \
+        '{
+            schema_version: 1,
+            generated: $generated,
+            hostname: $hostname,
+            audit_user: $audit_user,
+            services: $services,
+            files: $files,
+            documentation: {
+                root: "/opt/warpi/docs",
+                files: $docs,
+                count: ($docs | length)
+            },
+            gaps: $gaps,
+            summary: {
+                tracked_files: ($files | length),
+                existing_files: (
+                    $files
+                    | map(select(.exists == true))
+                    | length
+                ),
+                missing_files: (
+                    $files
+                    | map(select(.exists == false))
+                    | length
+                ),
+                validation_failures: (
+                    $files
+                    | map(select(.syntax_check == "failed"))
+                    | length
+                ),
+                unreadable_files: (
+                    $files
+                    | map(
+                        select(
+                            .exists == true
+                            and .readable == false
+                        )
+                    )
+                    | length
+                ),
+                documentation_files: ($docs | length),
+                gap_count: ($gaps | length)
+            }
+        }'
+)"
+
+case "$MODE" in
+    --json|json)
+        printf '%s\n' "$report" | jq .
+        ;;
+
+    --compact)
+        printf '%s\n' "$report" | jq -c .
+        ;;
+
+    --pretty|pretty)
+        printf '%s\n' "$report" | jq -r '
+            "
+============================================================
+              WARPi DOCUMENTATION AUDIT
+============================================================
+
+SYSTEM
+------------------------------------------------------------
+Hostname:             \(.hostname)
+Audit user:           \(.audit_user)
+Generated:            \(.generated)
+
+INVENTORY
+------------------------------------------------------------
+Tracked files:        \(.summary.tracked_files)
+Existing files:       \(.summary.existing_files)
+Missing files:        \(.summary.missing_files)
+Validation failures:  \(.summary.validation_failures)
+Unreadable files:     \(.summary.unreadable_files)
+Documentation files:  \(.summary.documentation_files)
+Documentation gaps:   \(.summary.gap_count)
+
+SERVICES
+------------------------------------------------------------
+KERNEL:               \(.services.warpi_kernel.active) / \(.services.warpi_kernel.enabled)
+Kismet:               \(.services.kismet.active) / \(.services.kismet.enabled)
+Tailscale:            \(.services.tailscale.active) / \(.services.tailscale.enabled)
+SSH:                  \(.services.ssh.active) / \(.services.ssh.enabled)
+
+GAPS
+------------------------------------------------------------
+\(
+    if (.gaps | length) == 0 then
+        "No documentation or validation gaps detected."
+    else
+        .gaps
+        | map(
+            "[\(.severity | ascii_upcase)] \(.message)"
+        )
+        | join("\n")
+    end
+)
+
+============================================================
+"
+        '
+        ;;
+
+    *)
+        echo "Usage: kernel-doc-audit [--json|--compact|--pretty]" >&2
+        exit 2
+        ;;
+esac
