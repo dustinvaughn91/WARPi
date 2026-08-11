@@ -12,6 +12,7 @@
 
 - Define the K.E.R.N.E.L./WARPi command contract.
 - Keep `warpi mode enter-field` and `warpi mode return-normal` in dry-run planner mode until the apply workflow and recovery path are explicitly approved.
+- Implement the reversible mode-transition design in staged milestones, starting with state machine and transaction framework only.
 - Validate field readiness: cold boot, trusted network, offline behavior, Tailscale reconnect, display status, logs/storage.
 - Review Bettercap service restart warning.
 - Review netplan permission warning.

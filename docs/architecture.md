@@ -46,6 +46,8 @@ Current mode reporting is implemented by `warpi-kernel.service`, supporting modu
 
 See [mode-control investigation](mode-control-investigation.md).
 
+Future real mode switching must follow the reversible transaction design in [mode transition design](mode-transition-design.md). That design keeps remote management survivability as a primary safety property and requires state-machine, rollback, boot recovery, observability, and staged tests before apply mode can be enabled.
+
 ## Diagram
 
 ```mermaid

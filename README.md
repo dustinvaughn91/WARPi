@@ -24,6 +24,7 @@ Baseline date: 2026-08-09
 - [Architecture](docs/architecture.md)
 - [Baseline: 2026-08-09](docs/baseline-2026-08-09.md)
 - [Mode-control investigation](docs/mode-control-investigation.md)
+- [Mode transition design](docs/mode-transition-design.md)
 - [Security model](docs/security.md)
 - [Backlog](docs/backlog.md)
 - [Changelog](docs/changelog.md)
