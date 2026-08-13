@@ -225,7 +225,68 @@ Validation levels:
 
 Preflight success does not authorize apply. A preflight snapshot becomes stale when live mode, active Wi-Fi profile, IP/default route, interface inventory, reboot/runtime identity, or transition metadata changes materially. Milestone B records a `stale` field for future use; a later verifier must compare the snapshot to live state before any apply can be considered.
 
-The next milestone should be a non-mutating rollback verifier / recovery planner that consumes a saved rollback snapshot and calculates exactly what would need to change to restore the source state, without applying those changes.
+## Milestone C Rollback Verifier And Recovery Planner
+
+Milestone C adds the non-mutating rollback-planning command:
+
+- `warpi mode rollback-plan`
+- `warpi mode rollback-plan --transaction <transition-id>`
+- `warpi mode rollback-plan --json`
+
+If no transaction is supplied, the command explicitly selects the latest preflight snapshot from `/var/lib/warpi/mode-transitions/last-preflight.json`. It never silently selects a malformed or invalid snapshot.
+
+The rollback verifier checks:
+
+- Snapshot schema version support.
+- Transaction ID format and requested transaction match.
+- Sibling `transaction.json` presence and transition ID correlation.
+- Completed PASS preflight metadata.
+- Source mode, target mode, and transition direction coherence.
+- Required recovery fields for WARPi state, network, Tailscale, services, and sidecar.
+- Hostname match.
+- Snapshot ownership, mode, and symlink safety.
+- Common credential-like strings that would indicate unsafe secret capture.
+
+Verifier results are classified as `PASS`, `WARN`, or `BLOCK`. A `BLOCK` result prevents recovery readiness and future executor eligibility.
+
+The planner captures current state read-only using the same normalized categories as rollback snapshots: WARPi mode/control state, NetworkManager-visible connection state, default route, route/address inventory, DNS, Tailscale service/backend/IP, firewall implementation/reference, critical service states, and sidecar isolation/reachability. It compares current state to the selected snapshot and records deterministic drift entries. Milestone C emits `UNCHANGED` and `RESTORE_REQUIRED` classifications; later executor design can extend this with `EXPECTED_DRIFT`, `WARNING`, and `BLOCKER`.
+
+Generated recovery plans are stored at:
+
+- `/var/lib/warpi/mode-transitions/<transition-id>/rollback-plan.json`
+
+Plan schema version 1 includes:
+
+- `schema_version`
+- `generated_at`
+- `transaction_id`
+- `snapshot_path`
+- `snapshot_sha256`
+- `verifier`
+- `drift_analysis`
+- `recovery_plan`
+- `recovery_readiness`
+- `apply_gate`
+
+Each recovery action includes sequence, phase, component, current state, desired state, proposed action, reason, risk level, connectivity impact, verification requirement, command preview, and `command_status: "NOT EXECUTED"`.
+
+Recovery phases are ordered to preserve management access:
+
+1. Phase 0: validate recovery data.
+2. Phase 1: establish or confirm the target uplink.
+3. Phase 2: restore addressing and routes only after the target uplink is confirmed.
+4. Phase 3: verify Tailscale management connectivity.
+5. Phase 4: restore firewall policy.
+6. Phase 5: restore sidecar isolation.
+7. Phase 6: restore service state.
+8. Phase 7: restore WARPi mode/control metadata.
+9. Phase 8: final health verification.
+
+Milestone C plans are preview-only. They do not execute commands, change routes, change Wi-Fi state, alter firewall rules, restart services, modify the NANO, enter Field Mode, or authorize any future `--apply`.
+
+Milestone C external Wi-Fi adapter finding: live read-only inspection at CLS showed only `wlan0` as a wireless netdev. `lsusb` showed the root hubs, VIA hub, and ASIX AX88772A sidecar Ethernet, but no separate external Wi-Fi adapter enumeration. `ip link` and NetworkManager device state did not show an additional wireless interface. Current evidence points to hardware not being detected by Linux at that moment, rather than WARPi detection logic missing an existing netdev. No driver reloads, scans, radio changes, or NetworkManager restarts were performed.
+
+The next milestone should be a staged mutating executor behind an explicit hard safety gate, with phase checkpoints, management-path verification, and automatic rollback logic. It should begin in an executor simulation mode before any real `--apply` path is approved.
 
 ## Future Runtime Mode State Machine
 

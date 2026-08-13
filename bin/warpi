@@ -72,6 +72,7 @@ Usage:
   warpi mode transition-status
   warpi mode preflight enter-field
   warpi mode preflight return-normal
+  warpi mode rollback-plan
   warpi mode enter-field
   warpi mode return-normal
   warpi wireless status
@@ -90,6 +91,8 @@ Commands:
                     Capture a non-mutating rollback snapshot for a future Field transition.
   mode preflight return-normal
                     Capture a non-mutating rollback snapshot for a future Normal return.
+  mode rollback-plan
+                    Verify a rollback snapshot and preview recovery actions without executing them.
   mode enter-field  Show the Field Mode transition plan without changing state.
   mode return-normal Show the Normal Mode transition plan without changing state.
   wireless status   Show read-only WiFi Pineapple NANO sidecar reachability.
@@ -102,6 +105,7 @@ Mode switching:
   enter-field and return-normal are dry-run only. Apply mode is intentionally not enabled yet.
   transition-status is read-only and supports --json for machine-readable output.
   preflight commands create rollback-snapshot metadata but do not change network state or mode.
+  rollback-plan is preview-only and supports --transaction ID and --json.
 
 Wireless:
   wireless status is read-only. It does not start scans, change radios, or modify NANO state.
@@ -205,6 +209,8 @@ transition_status_values() {
     local last_preflight_status last_preflight_id last_preflight_direction last_preflight_result
     local last_preflight_snapshot_path last_preflight_snapshot_valid last_preflight_blocker_count
     local last_preflight_warning_count last_preflight_completed_at last_preflight_stale
+    local rollback_plan_path rollback_plan_status rollback_plan_result rollback_plan_action_count
+    local rollback_plan_blockers rollback_plan_warnings rollback_plan_readiness rollback_plan_generated_at
 
     lock_file="$(transition_lock_file)"
     state_file="$(transition_state_file)"
@@ -249,6 +255,14 @@ transition_status_values() {
     last_preflight_warning_count="0"
     last_preflight_completed_at="none"
     last_preflight_stale="unknown"
+    rollback_plan_path="none"
+    rollback_plan_status="absent"
+    rollback_plan_result="none"
+    rollback_plan_action_count="0"
+    rollback_plan_blockers="0"
+    rollback_plan_warnings="0"
+    rollback_plan_readiness="none"
+    rollback_plan_generated_at="none"
 
     if [[ "$lock_status" == "unsafe-symlink" ]]; then
         unsafe_reasons="${unsafe_reasons}lock path is a symlink; "
@@ -274,6 +288,23 @@ transition_status_values() {
             last_preflight_warning_count="$(transition_json_value "$last_preflight_file" '.warning_count' '0')"
             last_preflight_completed_at="$(transition_json_value "$last_preflight_file" '.completed_at' 'none')"
             last_preflight_stale="$(transition_json_value "$last_preflight_file" '.stale' 'false')"
+            if [[ "$last_preflight_id" != "none" ]]; then
+                rollback_plan_path="$(transition_preflight_paths "$last_preflight_id")/rollback-plan.json"
+                rollback_plan_status="$(transition_file_status "$rollback_plan_path")"
+                if [[ "$rollback_plan_status" == "present" ]]; then
+                    if jq -e . "$rollback_plan_path" >/dev/null 2>&1; then
+                        rollback_plan_result="$(transition_json_value "$rollback_plan_path" '.verifier.result' 'none')"
+                        rollback_plan_action_count="$(transition_json_value "$rollback_plan_path" '.recovery_plan.action_count' '0')"
+                        rollback_plan_blockers="$(transition_json_value "$rollback_plan_path" '.verifier.blocker_count' '0')"
+                        rollback_plan_warnings="$(transition_json_value "$rollback_plan_path" '.verifier.warning_count' '0')"
+                        rollback_plan_readiness="$(transition_json_value "$rollback_plan_path" '.recovery_readiness' 'none')"
+                        rollback_plan_generated_at="$(transition_json_value "$rollback_plan_path" '.generated_at' 'none')"
+                    else
+                        unsafe_reasons="${unsafe_reasons}rollback plan JSON is malformed; "
+                        validation_status="unsafe"
+                    fi
+                fi
+            fi
         else
             unsafe_reasons="${unsafe_reasons}last preflight JSON is malformed; "
             validation_status="unsafe"
@@ -410,6 +441,14 @@ transition_status_values() {
         --arg last_preflight_warning_count "$last_preflight_warning_count" \
         --arg last_preflight_completed_at "$last_preflight_completed_at" \
         --arg last_preflight_stale "$last_preflight_stale" \
+        --arg rollback_plan_path "$rollback_plan_path" \
+        --arg rollback_plan_status "$rollback_plan_status" \
+        --arg rollback_plan_result "$rollback_plan_result" \
+        --arg rollback_plan_action_count "$rollback_plan_action_count" \
+        --arg rollback_plan_blockers "$rollback_plan_blockers" \
+        --arg rollback_plan_warnings "$rollback_plan_warnings" \
+        --arg rollback_plan_readiness "$rollback_plan_readiness" \
+        --arg rollback_plan_generated_at "$rollback_plan_generated_at" \
         --arg rollback_available "$rollback_available" \
         --arg validation_status "$validation_status" \
         --arg blockers "$blockers" \
@@ -463,6 +502,16 @@ transition_status_values() {
             available: $rollback_available,
             status: $rollback_status,
             path: $rollback_file
+          },
+          rollback_plan: {
+            status: $rollback_plan_status,
+            path: $rollback_plan_path,
+            verifier_result: $rollback_plan_result,
+            action_count: $rollback_plan_action_count,
+            blocker_count: $rollback_plan_blockers,
+            warning_count: $rollback_plan_warnings,
+            readiness: $rollback_plan_readiness,
+            generated_at: $rollback_plan_generated_at
           },
           validation: {
             status: $validation_status,
@@ -519,6 +568,15 @@ transition_status() {
     printf "%-32s %s\n" "Preflight warnings:" "$(jq -r '.preflight.warning_count' <<<"$status_json")"
     printf "%-32s %s\n" "Preflight completed:" "$(jq -r '.preflight.completed_at' <<<"$status_json")"
     printf "%-32s %s\n" "Preflight stale:" "$(jq -r '.preflight.stale' <<<"$status_json")"
+    echo
+    printf "%-32s %s\n" "Rollback plan:" "$(jq -r '.rollback_plan.status' <<<"$status_json")"
+    printf "%-32s %s\n" "Rollback plan path:" "$(jq -r '.rollback_plan.path' <<<"$status_json")"
+    printf "%-32s %s\n" "Rollback verifier:" "$(jq -r '.rollback_plan.verifier_result' <<<"$status_json")"
+    printf "%-32s %s\n" "Recovery action count:" "$(jq -r '.rollback_plan.action_count' <<<"$status_json")"
+    printf "%-32s %s\n" "Recovery blockers:" "$(jq -r '.rollback_plan.blocker_count' <<<"$status_json")"
+    printf "%-32s %s\n" "Recovery warnings:" "$(jq -r '.rollback_plan.warning_count' <<<"$status_json")"
+    printf "%-32s %s\n" "Recovery readiness:" "$(jq -r '.rollback_plan.readiness' <<<"$status_json")"
+    printf "%-32s %s\n" "Plan generated:" "$(jq -r '.rollback_plan.generated_at' <<<"$status_json")"
     echo
     printf "%-32s %s\n" "Validation status:" "$(jq -r '.validation.status' <<<"$status_json")"
     printf "%-32s %s\n" "Future apply eligible:" "$(jq -r '.validation.future_apply_eligible' <<<"$status_json")"
@@ -1220,6 +1278,441 @@ transition_preflight_report() {
     echo "============================================================"
 }
 
+plan_add_finding() {
+    preflight_add_finding "$@"
+}
+
+plan_add_drift() {
+    local file="$1"
+    local classification="$2"
+    local component="$3"
+    local field="$4"
+    local snapshot="$5"
+    local current="$6"
+    local message="$7"
+
+    jq -nc \
+        --arg classification "$classification" \
+        --arg component "$component" \
+        --arg field "$field" \
+        --arg snapshot "$snapshot" \
+        --arg current "$current" \
+        --arg message "$message" \
+        '{classification: $classification, component: $component, field: $field, snapshot: $snapshot, current: $current, message: $message}' >> "$file"
+}
+
+plan_add_action() {
+    local file="$1"
+    local phase="$2"
+    local component="$3"
+    local current="$4"
+    local desired="$5"
+    local action="$6"
+    local reason="$7"
+    local risk="$8"
+    local impact="$9"
+    local verify="${10}"
+    local command_preview="${11:-none}"
+
+    local seq
+    seq="$(($(wc -l < "$file" 2>/dev/null || echo 0) + 1))"
+    jq -nc \
+        --argjson sequence "$seq" \
+        --arg phase "$phase" \
+        --arg component "$component" \
+        --arg current "$current" \
+        --arg desired "$desired" \
+        --arg action "$action" \
+        --arg reason "$reason" \
+        --arg risk "$risk" \
+        --arg impact "$impact" \
+        --arg verify "$verify" \
+        --arg command_preview "$command_preview" \
+        '{
+          sequence: $sequence,
+          phase: $phase,
+          component: $component,
+          current_state: $current,
+          desired_state: $desired,
+          proposed_action: $action,
+          reason: $reason,
+          risk_level: $risk,
+          connectivity_impact: $impact,
+          verification_required: ($verify == "true"),
+          command_preview: $command_preview,
+          command_status: "NOT EXECUTED"
+        }' >> "$file"
+}
+
+snapshot_for_transaction() {
+    local transaction_id="$1"
+    local last_preflight
+
+    if [[ -z "$transaction_id" || "$transaction_id" == "latest" ]]; then
+        last_preflight="$(transition_last_preflight_file)"
+        require_json_object_file "$last_preflight" || return 1
+        jq -r '.snapshot_path // empty' "$last_preflight"
+        return
+    fi
+
+    if [[ ! "$transaction_id" =~ ^tx-[0-9TZ]+-[0-9a-f]{12}$ ]]; then
+        return 1
+    fi
+    printf '%s/%s/rollback-snapshot.json\n' "$(transition_recovery_dir)" "$transaction_id"
+}
+
+transaction_for_snapshot() {
+    local snapshot_path="$1"
+    printf '%s/transaction.json\n' "$(dirname "$snapshot_path")"
+}
+
+rollback_plan_for_snapshot() {
+    local snapshot_path="$1"
+    printf '%s/rollback-plan.json\n' "$(dirname "$snapshot_path")"
+}
+
+safe_file_metadata() {
+    local path="$1"
+    [[ -e "$path" && ! -L "$path" ]] || return 1
+    local mode owner
+    owner="$(stat -c '%U' "$path" 2>/dev/null || echo unknown)"
+    mode="$(stat -c '%a' "$path" 2>/dev/null || echo 777)"
+    [[ "$owner" == "root" ]] || return 1
+    [[ ${#mode} -ge 3 ]] || return 1
+    local group_digit="${mode: -2:1}"
+    local other_digit="${mode: -1}"
+    [[ "$group_digit" != "2" && "$group_digit" != "3" && "$group_digit" != "6" && "$group_digit" != "7" ]] || return 1
+    [[ "$other_digit" != "2" && "$other_digit" != "3" && "$other_digit" != "6" && "$other_digit" != "7" ]] || return 1
+}
+
+rollback_verify_snapshot() {
+    local snapshot_path="$1"
+    local findings_file="$2"
+    local transaction_id_expected="${3:-}"
+    local transaction_path
+
+    if [[ -z "$snapshot_path" || ! -e "$snapshot_path" ]]; then
+        plan_add_finding "$findings_file" "BLOCK" "snapshot-missing" "Rollback snapshot does not exist."
+        return
+    fi
+    if [[ -L "$snapshot_path" ]]; then
+        plan_add_finding "$findings_file" "BLOCK" "snapshot-symlink" "Rollback snapshot path is a symlink."
+        return
+    fi
+    safe_file_metadata "$snapshot_path" || plan_add_finding "$findings_file" "BLOCK" "snapshot-permissions" "Rollback snapshot ownership or permissions are unsafe."
+    require_json_object_file "$snapshot_path" || {
+        plan_add_finding "$findings_file" "BLOCK" "snapshot-malformed" "Rollback snapshot is not valid JSON object."
+        return
+    }
+
+    local schema transition_id source_mode target_mode direction host snapshot_valid
+    schema="$(jq -r '.schema_version // "missing"' "$snapshot_path")"
+    transition_id="$(jq -r '.transition_id // "missing"' "$snapshot_path")"
+    source_mode="$(jq -r '.source_mode // "missing"' "$snapshot_path")"
+    target_mode="$(jq -r '.target_mode // "missing"' "$snapshot_path")"
+    direction="$(jq -r '.transition_direction // "missing"' "$snapshot_path")"
+    host="$(jq -r '.system.hostname // "missing"' "$snapshot_path")"
+    snapshot_valid="$(jq -r '.validation.snapshot_complete // false' "$snapshot_path")"
+
+    [[ "$schema" == "1" ]] || plan_add_finding "$findings_file" "BLOCK" "unsupported-schema" "Rollback snapshot schema version is unsupported: $schema."
+    [[ "$transition_id" =~ ^tx-[0-9TZ]+-[0-9a-f]{12}$ ]] || plan_add_finding "$findings_file" "BLOCK" "invalid-transaction-id" "Snapshot transition ID is invalid."
+    [[ -z "$transaction_id_expected" || "$transition_id" == "$transaction_id_expected" ]] || plan_add_finding "$findings_file" "BLOCK" "transaction-id-mismatch" "Requested transaction ID does not match snapshot."
+    [[ "$source_mode" == "NORMAL" || "$source_mode" == "FIELD" ]] || plan_add_finding "$findings_file" "BLOCK" "missing-source-mode" "Snapshot source mode is invalid."
+    [[ "$target_mode" == "NORMAL" || "$target_mode" == "FIELD" ]] || plan_add_finding "$findings_file" "BLOCK" "missing-target-mode" "Snapshot target mode is invalid."
+    [[ "$direction" == "NORMAL_TO_FIELD" || "$direction" == "FIELD_TO_NORMAL" ]] || plan_add_finding "$findings_file" "BLOCK" "invalid-direction" "Snapshot transition direction is invalid."
+    [[ "$direction" != "NORMAL_TO_FIELD" || "$source_mode/$target_mode" == "NORMAL/FIELD" ]] || plan_add_finding "$findings_file" "BLOCK" "direction-mode-contradiction" "Snapshot direction contradicts source/target mode."
+    [[ "$direction" != "FIELD_TO_NORMAL" || "$source_mode/$target_mode" == "FIELD/NORMAL" ]] || plan_add_finding "$findings_file" "BLOCK" "direction-mode-contradiction" "Snapshot direction contradicts source/target mode."
+    [[ "$host" == "$(hostname 2>/dev/null || echo unknown)" ]] || plan_add_finding "$findings_file" "BLOCK" "hostname-mismatch" "Snapshot hostname does not match current host."
+    [[ "$snapshot_valid" == "true" ]] || plan_add_finding "$findings_file" "BLOCK" "snapshot-incomplete" "Snapshot is not marked complete."
+
+    local required=(
+        '.network.active_connection'
+        '.network.interface'
+        '.network.default_route'
+        '.network.default_interface'
+        '.tailscale.service_state'
+        '.tailscale.tailnet_ip'
+        '.services.warpi_kernel'
+        '.services.ssh'
+        '.sidecar.interface'
+        '.sidecar.management_path'
+    )
+    local expr
+    for expr in "${required[@]}"; do
+        jq -e "$expr != null and $expr != \"\"" "$snapshot_path" >/dev/null || plan_add_finding "$findings_file" "BLOCK" "missing-required-field" "Snapshot missing required field: $expr."
+    done
+
+    if jq -e '.. | strings | test("(?i)(BEGIN .*PRIVATE|PRIVATE KEY|Authorization:|Bearer |password=|psk=|token=|secret=)")' "$snapshot_path" >/dev/null; then
+        plan_add_finding "$findings_file" "BLOCK" "snapshot-secret-pattern" "Snapshot contains a credential-like pattern."
+    fi
+
+    transaction_path="$(transaction_for_snapshot "$snapshot_path")"
+    if [[ -f "$transaction_path" ]]; then
+        require_json_object_file "$transaction_path" || plan_add_finding "$findings_file" "BLOCK" "transaction-malformed" "Transaction metadata is malformed."
+        [[ "$(jq -r '.transition_id // empty' "$transaction_path" 2>/dev/null)" == "$transition_id" ]] || plan_add_finding "$findings_file" "BLOCK" "transaction-snapshot-mismatch" "Transaction metadata ID does not match snapshot."
+        [[ "$(jq -r '.validation_result // empty' "$transaction_path" 2>/dev/null)" == "PASS" ]] || plan_add_finding "$findings_file" "BLOCK" "transaction-not-pass" "Transaction metadata does not record a PASS preflight."
+    else
+        plan_add_finding "$findings_file" "BLOCK" "transaction-missing" "Transaction metadata file is missing."
+    fi
+}
+
+rollback_capture_current_json() {
+    local out="$1"
+    local default_route default_iface wifi_profile wifi_ssid active_iface tailscale_service tailscale_backend tailscale_ip nano_ping nano_ui default_uses_sidecar firewall_impl firewall_state
+    local warpi_kernel_state networkmanager_state ssh_state gpsd_state warpi_ui_state kismet_state addresses_json routes_json
+
+    default_route="$(ip route show default 2>/dev/null | head -n 1 || true)"
+    default_iface="$(awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' <<<"$default_route" | head -n 1)"
+    wifi_profile="$(json_value '.network.wifi_profile' 'unknown')"
+    wifi_ssid="$(json_value '.network.wifi_ssid' 'unknown')"
+    active_iface="$(json_value '.network.interface' 'unknown')"
+    tailscale_service="$(systemctl is-active tailscaled.service 2>/dev/null || true)"
+    tailscale_backend="$(command_json_or_empty tailscale status --json | jq -r '.BackendState // "unknown"' 2>/dev/null || echo unknown)"
+    tailscale_ip="$(command_json_or_empty tailscale status --json | jq -r '.Self.TailscaleIPs[0] // "unknown"' 2>/dev/null || echo unknown)"
+    if ping -c 1 -W 2 "$NANO_HOST" >/dev/null 2>&1; then nano_ping="true"; else nano_ping="false"; fi
+    if timeout 4 bash -c ":</dev/tcp/$NANO_HOST/$NANO_UI_PORT" >/dev/null 2>&1; then nano_ui="true"; else nano_ui="false"; fi
+    if [[ "$default_iface" == "$NANO_INTERFACE" ]]; then default_uses_sidecar="true"; else default_uses_sidecar="false"; fi
+    warpi_kernel_state="$(systemctl is-active "$KERNEL_SERVICE" 2>/dev/null || true)"
+    networkmanager_state="$(systemctl is-active NetworkManager.service 2>/dev/null || true)"
+    ssh_state="$(systemctl is-active ssh.service 2>/dev/null || true)"
+    gpsd_state="$(systemctl is-active gpsd.service 2>/dev/null || true)"
+    warpi_ui_state="$(systemctl is-active warpi-ui.service 2>/dev/null || true)"
+    kismet_state="$(systemctl is-active kismet.service 2>/dev/null || true)"
+    addresses_json="$(command_json_or_empty ip -j addr show)"
+    routes_json="$(command_json_or_empty ip -j route show)"
+    if command -v nft >/dev/null 2>&1; then
+        firewall_impl="nftables"
+        firewall_state="$(command_text_or_empty nft list tables)"
+    elif command -v iptables-save >/dev/null 2>&1; then
+        firewall_impl="iptables"
+        firewall_state="$(command_text_or_empty iptables-save -t filter | sed -n '1,80p')"
+    else
+        firewall_impl="unknown"
+        firewall_state=""
+    fi
+
+    jq -n \
+        --arg captured_at "$(utc_now)" \
+        --arg hostname "$(hostname 2>/dev/null || echo unknown)" \
+        --arg mode "$(json_value '.mode' 'unknown')" \
+        --arg state "$(json_value '.state' 'unknown')" \
+        --arg field_marker_present "$([[ -e "$FIELD_MARKER" ]] && echo true || echo false)" \
+        --arg wifi_profile "$wifi_profile" \
+        --arg wifi_ssid "$wifi_ssid" \
+        --arg active_iface "$active_iface" \
+        --arg default_route "$default_route" \
+        --arg default_iface "$default_iface" \
+        --arg dns_info "$(command_text_or_empty resolvectl dns)" \
+        --arg tailscale_service "$tailscale_service" \
+        --arg tailscale_backend "$tailscale_backend" \
+        --arg tailscale_ip "$tailscale_ip" \
+        --arg firewall_impl "$firewall_impl" \
+        --arg firewall_state "$firewall_state" \
+        --arg nano_interface "$NANO_INTERFACE" \
+        --arg nano_host "$NANO_HOST" \
+        --arg nano_port "$NANO_UI_PORT" \
+        --arg nano_ping "$nano_ping" \
+        --arg nano_ui "$nano_ui" \
+        --arg default_uses_sidecar "$default_uses_sidecar" \
+        --arg warpi_kernel_state "$warpi_kernel_state" \
+        --arg networkmanager_state "$networkmanager_state" \
+        --arg ssh_state "$ssh_state" \
+        --arg gpsd_state "$gpsd_state" \
+        --arg warpi_ui_state "$warpi_ui_state" \
+        --arg kismet_state "$kismet_state" \
+        --argjson addresses "${addresses_json:-[]}" \
+        --argjson routes "${routes_json:-[]}" \
+        '{
+          captured_at: $captured_at,
+          system: {hostname: $hostname},
+          warpi: {mode: $mode, state: $state, field_marker_present: ($field_marker_present == "true")},
+          network: {active_connection: $wifi_profile, ssid: $wifi_ssid, interface: $active_iface, addresses: $addresses, default_route: $default_route, default_interface: $default_iface, relevant_routes: $routes, dns: $dns_info},
+          tailscale: {service_state: $tailscale_service, backend_state: $tailscale_backend, tailnet_ip: $tailscale_ip, management_path_present: ($tailscale_backend == "Running")},
+          firewall: {implementation: $firewall_impl, snapshot_reference_or_safe_state: $firewall_state},
+          services: {
+            warpi_kernel: $warpi_kernel_state,
+            tailscaled: $tailscale_service,
+            networkmanager: $networkmanager_state,
+            ssh: $ssh_state,
+            gpsd: $gpsd_state,
+            warpi_ui: $warpi_ui_state,
+            kismet: $kismet_state
+          },
+          sidecar: {interface: $nano_interface, management_path: $nano_host, ui_port: ($nano_port|tonumber), nano_reachable: ($nano_ping == "true"), ui_port_reachable: ($nano_ui == "true"), default_route_uses_sidecar: ($default_uses_sidecar == "true")}
+        }' > "$out"
+}
+
+compare_field() {
+    local snapshot="$1" current="$2" drifts="$3" actions="$4" component="$5" field="$6" snapshot_expr="$7" current_expr="$8" phase="$9" action="${10}" risk="${11:-LOW}" impact="${12:-none}"
+    local old new
+    old="$(jq -r "$snapshot_expr // \"unknown\"" "$snapshot")"
+    new="$(jq -r "$current_expr // \"unknown\"" "$current")"
+    if [[ "$old" != "$new" ]]; then
+        plan_add_drift "$drifts" "RESTORE_REQUIRED" "$component" "$field" "$old" "$new" "$component $field differs from rollback snapshot."
+        plan_add_action "$actions" "$phase" "$component" "$new" "$old" "$action" "$component $field differs from rollback snapshot." "$risk" "$impact" "true" "preview only; exact command requires executor validation"
+    else
+        plan_add_drift "$drifts" "UNCHANGED" "$component" "$field" "$old" "$new" "$component $field matches rollback snapshot."
+    fi
+}
+
+transition_rollback_plan() {
+    local transaction_id="latest"
+    local output_format="human"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --transaction)
+                transaction_id="${2:-}"
+                shift 2
+                ;;
+            --json)
+                output_format="json"
+                shift
+                ;;
+            --human)
+                output_format="human"
+                shift
+                ;;
+            *)
+                echo "Unknown rollback-plan option: $1" >&2
+                echo "Try: warpi mode rollback-plan --transaction <transition-id>" >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    require_state
+
+    if [[ "${EUID:-$(id -u)}" -ne 0 && "$(transition_recovery_dir)" != /tmp/* ]]; then
+        if sudo -n true 2>/dev/null; then
+            local sudo_args=(mode rollback-plan)
+            if [[ "$transaction_id" != "latest" ]]; then
+                sudo_args+=(--transaction "$transaction_id")
+            fi
+            if [[ "$output_format" == "json" ]]; then
+                sudo_args+=(--json)
+            fi
+            exec sudo -n "$0" "${sudo_args[@]}"
+        fi
+        echo "warpi mode rollback-plan requires root or passwordless sudo for protected plan metadata writes." >&2
+        exit 1
+    fi
+
+    local snapshot_path transaction_id_actual plan_path findings drifts actions current_json blockers warnings action_count verifier readiness snapshot_hash generated_at
+    snapshot_path="$(snapshot_for_transaction "$transaction_id")" || {
+        echo "No valid rollback snapshot selected." >&2
+        exit 2
+    }
+    transaction_id_actual="$(jq -r '.transition_id // empty' "$snapshot_path" 2>/dev/null || true)"
+    findings="$(mktemp)"
+    drifts="$(mktemp)"
+    actions="$(mktemp)"
+    current_json="$(mktemp)"
+    trap "rm -f '$findings' '$drifts' '$actions' '$current_json'" EXIT
+
+    rollback_verify_snapshot "$snapshot_path" "$findings" "${transaction_id/latest/}"
+    rollback_capture_current_json "$current_json"
+    snapshot_hash="$(sha256sum "$snapshot_path" 2>/dev/null | awk '{print $1}')"
+    generated_at="$(utc_now)"
+
+    if require_json_object_file "$snapshot_path"; then
+        plan_add_action "$actions" "PHASE 0 - Validate recovery data" "Verifier" "snapshot selected" "verified snapshot" "Validate snapshot schema, ownership, permissions, transaction metadata, and secret exclusion." "Recovery input must be trustworthy before any future executor can act." "LOW" "none" "true" "warpi mode rollback-plan --transaction $transaction_id_actual"
+        compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "WARPi mode" "mode" '.warpi.mode' '.warpi.mode' "PHASE 7 - Restore WARPi mode/control metadata" "Restore WARPi mode/control metadata to snapshot source state." "MEDIUM" "none until executor applies"
+        compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "Network" "active connection" '.network.active_connection' '.network.active_connection' "PHASE 1 - Establish/confirm target uplink" "Confirm or restore the snapshot NetworkManager connection/profile." "HIGH" "management path sensitive"
+        compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "Network" "default route" '.network.default_route' '.network.default_route' "PHASE 2 - Restore addressing/routes" "Restore default route only after target uplink is confirmed." "HIGH" "could affect management if executed out of order"
+        compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "Tailscale" "backend" '.tailscale.backend_state' '.tailscale.backend_state' "PHASE 3 - Verify management connectivity" "Restore or verify Tailscale backend state." "HIGH" "management path"
+        compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "Tailscale" "tailnet IP" '.tailscale.tailnet_ip' '.tailscale.tailnet_ip' "PHASE 3 - Verify management connectivity" "Verify Tailscale IP matches rollback snapshot or re-establish management path." "HIGH" "management path"
+        compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "Firewall" "implementation" '.firewall.implementation' '.firewall.implementation' "PHASE 4 - Restore firewall policy" "Restore firewall implementation/policy reference." "MEDIUM" "could affect access if executed"
+        compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "Sidecar" "default route isolation" '(.sidecar.default_route_uses_sidecar|tostring)' '(.sidecar.default_route_uses_sidecar|tostring)' "PHASE 5 - Restore sidecar isolation" "Ensure sidecar does not own the default route." "HIGH" "management route safety"
+        for svc in warpi_kernel tailscaled networkmanager ssh gpsd warpi_ui kismet; do
+            compare_field "$snapshot_path" "$current_json" "$drifts" "$actions" "Service" "$svc" ".services.$svc" ".services.$svc" "PHASE 6 - Restore service state" "Restore service state for $svc if executor later approves." "MEDIUM" "service dependent"
+        done
+        plan_add_action "$actions" "PHASE 8 - Final health verification" "Health" "not verified by executor" "NORMAL/CONNECTED with management path" "Run final health checks after any future recovery executor." "Recovery must not be marked complete before health verification." "LOW" "none" "true" "warpi mode status; warpi wireless status; warpi report"
+    fi
+
+    blockers="$(preflight_count_findings "$findings" "BLOCK")"
+    warnings="$(preflight_count_findings "$findings" "WARN")"
+    action_count="$(wc -l < "$actions" | tr -d ' ')"
+    if [[ "$blockers" -eq 0 ]]; then
+        verifier="PASS"
+        readiness="READY_FOR_STAGED_EXECUTOR_DEVELOPMENT"
+    else
+        verifier="BLOCK"
+        readiness="BLOCKED"
+    fi
+    plan_path="$(rollback_plan_for_snapshot "$snapshot_path")"
+
+    jq -n \
+        --arg generated_at "$generated_at" \
+        --arg transaction_id "$transaction_id_actual" \
+        --arg snapshot_path "$snapshot_path" \
+        --arg snapshot_hash "$snapshot_hash" \
+        --arg verifier "$verifier" \
+        --arg blockers "$blockers" \
+        --arg warnings "$warnings" \
+        --arg action_count "$action_count" \
+        --arg readiness "$readiness" \
+        --argjson findings "$(preflight_findings_json "$findings")" \
+        --argjson drift "$(preflight_findings_json "$drifts")" \
+        --argjson actions_json "$(preflight_findings_json "$actions")" \
+        '{
+          schema_version: 1,
+          generated_at: $generated_at,
+          transaction_id: $transaction_id,
+          snapshot_path: $snapshot_path,
+          snapshot_sha256: $snapshot_hash,
+          verifier: {
+            result: $verifier,
+            blocker_count: ($blockers|tonumber),
+            warning_count: ($warnings|tonumber),
+            findings: $findings
+          },
+          drift_analysis: $drift,
+          recovery_plan: {
+            generated: true,
+            action_count: ($action_count|tonumber),
+            actions: $actions_json,
+            execution_status: "NOT EXECUTED"
+          },
+          recovery_readiness: $readiness,
+          apply_gate: "rollback plan is preview-only; live apply remains disabled"
+        }' | atomic_write_json "$plan_path" 640 root "$(transition_read_group)"
+
+    if [[ "$output_format" == "json" ]]; then
+        jq '.' "$plan_path"
+        return
+    fi
+    rollback_plan_report "$plan_path"
+}
+
+rollback_plan_report() {
+    local plan_path="$1"
+    echo
+    echo "============================================================"
+    echo "              WARPi ROLLBACK PLAN"
+    echo "============================================================"
+    echo
+    echo "Preview only. No recovery commands were executed."
+    echo
+    printf "%-28s %s\n" "Transaction ID:" "$(jq -r '.transaction_id' "$plan_path")"
+    printf "%-28s %s\n" "Verifier result:" "$(jq -r '.verifier.result' "$plan_path")"
+    printf "%-28s %s\n" "Snapshot path:" "$(jq -r '.snapshot_path' "$plan_path")"
+    printf "%-28s %s\n" "Action count:" "$(jq -r '.recovery_plan.action_count' "$plan_path")"
+    printf "%-28s %s\n" "Blockers:" "$(jq -r '.verifier.blocker_count' "$plan_path")"
+    printf "%-28s %s\n" "Warnings:" "$(jq -r '.verifier.warning_count' "$plan_path")"
+    printf "%-28s %s\n" "Readiness:" "$(jq -r '.recovery_readiness' "$plan_path")"
+    printf "%-28s %s\n" "Plan path:" "$plan_path"
+    echo
+    echo "DRIFT ANALYSIS"
+    echo "------------------------------------------------------------"
+    jq -r '.drift_analysis[] | "- [" + .classification + "] " + .component + " " + .field + ": snapshot=" + .snapshot + " current=" + .current' "$plan_path"
+    echo
+    echo "RECOVERY ACTION PREVIEW - NOT EXECUTED"
+    echo "------------------------------------------------------------"
+    jq -r '.recovery_plan.actions[] | (.sequence|tostring) + ". " + .phase + " / " + .component + "\n   Current: " + .current_state + "\n   Desired: " + .desired_state + "\n   Action: " + .proposed_action + "\n   Risk: " + .risk_level + " | Connectivity: " + .connectivity_impact + "\n   Preview: " + .command_preview' "$plan_path"
+    echo
+    echo "============================================================"
+}
+
 mode_status() {
     require_state
 
@@ -1587,6 +2080,9 @@ case "${1:-help}" in
                         exit 2
                         ;;
                 esac
+                ;;
+            rollback-plan)
+                transition_rollback_plan "${@:3}"
                 ;;
             enter-field)
                 case "${3:-}" in
