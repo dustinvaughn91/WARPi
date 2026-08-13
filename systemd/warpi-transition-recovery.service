@@ -1,0 +1,21 @@
+[Unit]
+Description=WARPi transition recovery classifier
+Documentation=/opt/warpi/docs/mode-transition-design.md
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warpi mode recovery-status --record
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/run/warpi /var/lib/warpi/mode-transitions
+
+[Install]
+WantedBy=multi-user.target

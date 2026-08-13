@@ -761,6 +761,30 @@ Milestone E: disabled live adapter architecture, hard gate, arming framework, ex
 
 Milestone F: controlled live readiness and hardware validation after the external Wi-Fi adapter positively enumerates.
 
+### Milestone F Update - Controlled Readiness, Not Execution
+
+On 2026-08-13, the Panda assessment radio positively enumerated and was validated without scanning, monitor mode, route changes, or NetworkManager changes:
+
+- USB VID:PID: `0e8d:7612`
+- Manufacturer/chipset: MediaTek MT7612U
+- Driver: `mt76x2u`
+- PHY/interface: `phy1` / `wlan1`
+- MAC: `9c:ef:d5:f8:98:83`
+- NetworkManager state: disconnected
+
+The management radio remains `wlan0` / `phy0` on `CLS Health`, and the NANO sidecar remains ASIX Ethernet on `eth1`. The hardware gate now treats this approved Panda identity as `VALIDATED` when it is present, distinct from `wlan0`, not the default route, not the Tailscale management uplink, and not the NANO sidecar. The gate still returns `callable=false` while live executor feature flag and operator authorization are absent.
+
+Milestone F also introduces the tracked `systemd/warpi-transition-recovery.service` unit. Its live role is status-only while the executor is disabled:
+
+- inspect transaction/checkpoint state at startup;
+- clear stale executor arm files;
+- record recovery recommendation under `/run/warpi`;
+- classify clean, interrupted, rollback-required, and manual-intervention states;
+- avoid Mission Control dependency;
+- perform no network, route, firewall, service, mode, or rollback mutation.
+
+The first controlled live transition test remains a future milestone. It must start from a fresh baseline, fresh preflight, rollback verifier PASS, watchdog HEALTHY, explicit operator approval, a transaction-bound arm, staged checkpoints, and a planned return to NORMAL. Milestone F does not authorize end-to-end `--apply`.
+
 Milestone G: staged live adapter validation under explicit approval, still not end-to-end FIELD apply.
 
 Milestone H: supervised live transition rehearsal with local recovery path and management watchdog.

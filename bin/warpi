@@ -26,6 +26,9 @@ EXECUTOR_ARM_FILE="${EXECUTOR_ARM_FILE:-/run/warpi/mode-executor.arm}"
 EXECUTOR_RECOVERY_STATUS_FILE="${EXECUTOR_RECOVERY_STATUS_FILE:-/run/warpi/mode-recovery-status.json}"
 EXECUTOR_CHECKPOINT_SCHEMA_VERSION="2"
 EXECUTOR_WATCHDOG_LOST_THRESHOLD="${EXECUTOR_WATCHDOG_LOST_THRESHOLD:-3}"
+ASSESSMENT_RADIO_APPROVED_VIDPID="${ASSESSMENT_RADIO_APPROVED_VIDPID:-0e8d:7612}"
+ASSESSMENT_RADIO_APPROVED_DRIVER="${ASSESSMENT_RADIO_APPROVED_DRIVER:-mt76x2u}"
+ASSESSMENT_RADIO_APPROVED_MAC="${ASSESSMENT_RADIO_APPROVED_MAC:-9c:ef:d5:f8:98:83}"
 
 config_value() {
     local key="$1"
@@ -122,6 +125,8 @@ Commands:
 	                    Show Milestone E live-gate, arming, hardware, watchdog, and blockers.
 	  mode recovery-status
 	                    Show boot/interruption recovery recommendation without mutating state.
+	  mode recovery-status --record
+	                    Record startup recovery recommendation and clear stale live authorization only.
 	  mode watchdog-status
 	                    Show read-only management-path watchdog state.
 	  mode adapters      List staged action adapters and their disabled live-execution status.
@@ -949,7 +954,7 @@ preflight_capture_snapshot() {
     local wifi_profile wifi_ssid active_iface default_route default_iface dns_info nm_active
     local tailscale_service tailscale_backend tailscale_ip ts_management
     local nano_ping nano_ui default_uses_sidecar firewall_impl firewall_state
-    local root_percent available_kb extra_wifi
+    local root_percent available_kb extra_wifi hardware_json hardware_ready hardware_eligibility hardware_iface hardware_phy hardware_driver hardware_mac hardware_usb hardware_nm_state
     local warpi_kernel_state networkmanager_state ssh_state gpsd_state warpi_ui_state kismet_state
     local field_marker_present addresses_json routes_json
 
@@ -979,9 +984,21 @@ preflight_capture_snapshot() {
     warpi_ui_state="$(systemctl is-active warpi-ui.service 2>/dev/null || true)"
     kismet_state="$(systemctl is-active kismet.service 2>/dev/null || true)"
     field_marker_present="$([[ -e "$FIELD_MARKER" ]] && echo true || echo false)"
-    addresses_json="$(command_json_or_empty ip -j addr show)"
-    routes_json="$(command_json_or_empty ip -j route show)"
+    addresses_json="$(command_json_or_empty ip -j addr show | jq -c . 2>/dev/null || echo '[]')"
+    routes_json="$(command_json_or_empty ip -j route show | jq -c . 2>/dev/null || echo '[]')"
     extra_wifi="$(find /sys/class/net -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | grep -E '^(wl|wlan)' | grep -v '^wlan0$' | head -n 1 || true)"
+    hardware_json="$(executor_gate_json 2>/dev/null | jq -c '.hardware // {}' 2>/dev/null || echo '{}')"
+    if ! jq -e . >/dev/null 2>&1 <<<"$hardware_json"; then
+        hardware_json="$(sed 's/}}$/}/' <<<"$hardware_json" | jq -c . 2>/dev/null || echo '{}')"
+    fi
+    hardware_ready="$(jq -r '.ready // false' <<<"$hardware_json" 2>/dev/null || echo false)"
+    hardware_eligibility="$(jq -r '.eligibility // "unknown"' <<<"$hardware_json" 2>/dev/null || echo unknown)"
+    hardware_iface="$(jq -r '.assessment_radio.interface // "none"' <<<"$hardware_json" 2>/dev/null || echo none)"
+    hardware_phy="$(jq -r '.assessment_radio.phy // "none"' <<<"$hardware_json" 2>/dev/null || echo none)"
+    hardware_driver="$(jq -r '.assessment_radio.driver // "none"' <<<"$hardware_json" 2>/dev/null || echo none)"
+    hardware_mac="$(jq -r '.assessment_radio.mac // "none"' <<<"$hardware_json" 2>/dev/null || echo none)"
+    hardware_usb="$(jq -r '.assessment_radio.usb_id // "none"' <<<"$hardware_json" 2>/dev/null || echo none)"
+    hardware_nm_state="$(jq -r '.assessment_radio.networkmanager_state // "none"' <<<"$hardware_json" 2>/dev/null || echo none)"
 
     if ping -c 1 -W 2 "$NANO_HOST" >/dev/null 2>&1; then
         nano_ping="true"
@@ -1026,7 +1043,7 @@ preflight_capture_snapshot() {
     [[ "$nano_ping" == "true" ]] || preflight_add_finding "$findings_file" "WARN" "nano-ping-unreachable" "NANO sidecar ping is not reachable."
     [[ "$nano_ui" == "true" ]] || preflight_add_finding "$findings_file" "WARN" "nano-ui-unreachable" "NANO UI TCP port is not reachable."
     [[ -e /sys/class/net/"$NANO_INTERFACE" ]] || preflight_add_finding "$findings_file" "WARN" "nano-interface-missing" "Configured NANO interface is not present."
-    [[ -n "$extra_wifi" ]] || preflight_add_finding "$findings_file" "WARN" "external-wifi-not-detected" "No additional wireless interface beyond wlan0 was detected."
+    [[ "$hardware_ready" == "true" ]] || preflight_add_finding "$findings_file" "WARN" "external-wifi-not-validated" "Approved external assessment Wi-Fi radio is not positively validated."
     [[ "${available_kb:-0}" -gt 102400 ]] || preflight_add_finding "$findings_file" "BLOCK" "low-root-disk-space" "Root filesystem has less than 100 MB available."
 
     jq -n \
@@ -1073,6 +1090,14 @@ preflight_capture_snapshot() {
         --arg field_marker_present "$field_marker_present" \
         --argjson addresses "${addresses_json:-[]}" \
         --argjson routes "${routes_json:-[]}" \
+        --arg hardware_ready "$hardware_ready" \
+        --arg hardware_eligibility "$hardware_eligibility" \
+        --arg hardware_iface "$hardware_iface" \
+        --arg hardware_phy "$hardware_phy" \
+        --arg hardware_driver "$hardware_driver" \
+        --arg hardware_mac "$hardware_mac" \
+        --arg hardware_usb "$hardware_usb" \
+        --arg hardware_nm_state "$hardware_nm_state" \
         '{
           schema_version: ($schema_version | tonumber),
           transition_id: $transition_id,
@@ -1133,6 +1158,32 @@ preflight_capture_snapshot() {
             ui_port_reachable: ($nano_ui == "true"),
             default_route_uses_sidecar: ($default_uses_sidecar == "true")
           },
+          hardware: {
+            ready: ($hardware_ready == "true"),
+            eligibility: $hardware_eligibility,
+            approved_identity: {
+              usb_id: "0e8d:7612",
+              driver: "mt76x2u",
+              mac: "9c:ef:d5:f8:98:83"
+            },
+            assessment_radio: {
+              interface: $hardware_iface,
+              phy: $hardware_phy,
+              driver: $hardware_driver,
+              mac: $hardware_mac,
+              usb_id: $hardware_usb,
+              networkmanager_state: $hardware_nm_state,
+              role: "assessment"
+            },
+            management_radio: {
+              interface: "wlan0",
+              role: "management"
+            },
+            nano_sidecar: {
+              interface: $nano_interface,
+              role: "sidecar"
+            }
+          },
           validation: {
             snapshot_complete: false,
             missing_fields: [],
@@ -1171,6 +1222,7 @@ preflight_validate_snapshot() {
         '.services.warpi_kernel'
         '.services.ssh'
         '.sidecar.default_route_uses_sidecar'
+        '.hardware.eligibility'
     )
     local expr
     for expr in "${required[@]}"; do
@@ -1996,7 +2048,60 @@ simulation_validate_checkpoint() {
 }
 
 simulation_hardware_ready() {
-    find /sys/class/net -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | grep -E '^(wl|wlan)' | grep -v '^wlan0$' | head -n 1
+    executor_external_wifi_json | jq -r 'select(.ready == true) | .assessment_radio.interface // empty' 2>/dev/null | head -n 1
+}
+
+assessment_radio_inventory_json() {
+    if [[ -n "${WARPI_ASSESSMENT_RADIO_FIXTURE_JSON:-}" ]]; then
+        printf '%s\n' "$WARPI_ASSESSMENT_RADIO_FIXTURE_JSON"
+        return
+    fi
+
+    local rows
+    rows="$(mktemp)"
+    for iface_path in /sys/class/net/*; do
+        local iface driver device phy mac nm_state udev_line usb_id manufacturer product role default_iface is_management is_default approved
+        iface="$(basename "$iface_path")"
+        [[ "$iface" == wlan* || "$iface" == wl* ]] || continue
+        device="$(readlink -f "$iface_path/device" 2>/dev/null || echo none)"
+        driver="$(basename "$(readlink -f "$iface_path/device/driver" 2>/dev/null || echo none)")"
+        phy="$(basename "$(readlink -f "$iface_path/phy80211" 2>/dev/null || echo none)")"
+        mac="$(cat "$iface_path/address" 2>/dev/null || echo unknown)"
+        nm_state="$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: -v i="$iface" '$1==i {print $3; found=1} END {if (!found) print "unknown"}')"
+        default_iface="$(ip route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')"
+        udev_line="$(udevadm info -q property -p "$iface_path" 2>/dev/null || true)"
+        usb_id="$(awk -F= '/^ID_VENDOR_ID=/{vendor=$2} /^ID_MODEL_ID=/{model=$2} END {if (vendor && model) print vendor ":" model; else print "unknown"}' <<<"$udev_line")"
+        manufacturer="$(awk -F= '/^ID_VENDOR_FROM_DATABASE=/{print $2; found=1} END {if (!found) print "unknown"}' <<<"$udev_line")"
+        product="$(awk -F= '/^ID_MODEL_FROM_DATABASE=/{print $2; found=1} END {if (!found) print "unknown"}' <<<"$udev_line")"
+        if [[ "$usb_id" == "unknown" ]]; then
+            local probe vendor product_id
+            probe="$device"
+            while [[ "$probe" != "/" && -n "$probe" ]]; do
+                if [[ -r "$probe/idVendor" && -r "$probe/idProduct" ]]; then
+                    vendor="$(cat "$probe/idVendor" 2>/dev/null || true)"
+                    product_id="$(cat "$probe/idProduct" 2>/dev/null || true)"
+                    if [[ -n "$vendor" && -n "$product_id" ]]; then
+                        usb_id="${vendor}:${product_id}"
+                        break
+                    fi
+                fi
+                probe="$(dirname "$probe")"
+            done
+        fi
+        is_management="false"; is_default="false"; approved="false"; role="candidate"
+        [[ "$iface" == "wlan0" ]] && { is_management="true"; role="management"; }
+        [[ "$iface" == "$default_iface" ]] && is_default="true"
+        if [[ "$is_management" == "false" && "$is_default" == "false" && "$usb_id" == "$ASSESSMENT_RADIO_APPROVED_VIDPID" && "$driver" == "$ASSESSMENT_RADIO_APPROVED_DRIVER" && "$mac" == "$ASSESSMENT_RADIO_APPROVED_MAC" ]]; then
+            approved="true"; role="assessment"
+        fi
+        jq -nc --arg iface "$iface" --arg driver "$driver" --arg phy "$phy" --arg mac "$mac" \
+            --arg device "$device" --arg nm_state "$nm_state" --arg usb_id "$usb_id" \
+            --arg manufacturer "$manufacturer" --arg product "$product" --arg role "$role" \
+            --arg is_management "$is_management" --arg is_default "$is_default" --arg approved "$approved" \
+            '{interface:$iface,driver:$driver,phy:$phy,mac:$mac,device_path:$device,networkmanager_state:$nm_state,usb_id:$usb_id,manufacturer:$manufacturer,product:$product,role:$role,is_management:($is_management=="true"),is_default_route:($is_default=="true"),approved:($approved=="true")}' >> "$rows"
+    done
+    jq -s '.' "$rows"
+    rm -f "$rows"
 }
 
 simulation_run() {
@@ -2398,37 +2503,33 @@ executor_arm_status_json() {
 }
 
 executor_external_wifi_json() {
-    local wlan0_driver wlan0_phy default_iface rows count
+    local wlan0_driver wlan0_phy default_iface wlan0_mac radios assessment count
     wlan0_driver="$(basename "$(readlink -f /sys/class/net/wlan0/device/driver 2>/dev/null || echo none)")"
+    wlan0_phy="$(basename "$(readlink -f /sys/class/net/wlan0/phy80211 2>/dev/null || echo none)")"
+    wlan0_mac="$(cat /sys/class/net/wlan0/address 2>/dev/null || echo unknown)"
     default_iface="$(ip route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')"
-    rows="$(mktemp)"
-    for iface_path in /sys/class/net/*; do
-        local iface type driver device phy mac nm_state
-        iface="$(basename "$iface_path")"
-        [[ "$iface" == wlan* || "$iface" == wl* ]] || continue
-        [[ "$iface" == "wlan0" ]] && continue
-        device="$(readlink -f "$iface_path/device" 2>/dev/null || echo none)"
-        driver="$(basename "$(readlink -f "$iface_path/device/driver" 2>/dev/null || echo none)")"
-        phy="$(basename "$(readlink -f "$iface_path/phy80211" 2>/dev/null || echo none)")"
-        mac="$(cat "$iface_path/address" 2>/dev/null || echo unknown)"
-        nm_state="$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: -v i="$iface" '$1==i {print $3; found=1} END {if (!found) print "unknown"}')"
-        jq -nc --arg iface "$iface" --arg driver "$driver" --arg phy "$phy" --arg mac "$mac" --arg device "$device" --arg nm_state "$nm_state" \
-            '{interface:$iface,driver:$driver,phy:$phy,mac:$mac,device_path:$device,networkmanager_state:$nm_state}' >> "$rows"
-    done
-    count="$(wc -l < "$rows" | tr -d ' ')"
-    jq -n --slurpfile radios "$rows" --arg count "$count" --arg wlan0_driver "$wlan0_driver" --arg default_iface "$default_iface" \
+    radios="$(assessment_radio_inventory_json)"
+    assessment="$(jq -c '[.[] | select(.role=="assessment" and .approved==true)] | first // null' <<<"$radios")"
+    count="$(jq '[.[] | select(.interface!="wlan0")] | length' <<<"$radios")"
+    jq -n --argjson radios "$radios" --argjson assessment "$assessment" \
+        --arg count "$count" --arg wlan0_driver "$wlan0_driver" --arg wlan0_phy "$wlan0_phy" \
+        --arg wlan0_mac "$wlan0_mac" --arg default_iface "$default_iface" \
+        --arg approved_vidpid "$ASSESSMENT_RADIO_APPROVED_VIDPID" \
+        --arg approved_driver "$ASSESSMENT_RADIO_APPROVED_DRIVER" \
+        --arg approved_mac "$ASSESSMENT_RADIO_APPROVED_MAC" \
         '{
           schema_version:1,
-          ready: (($count|tonumber) > 0),
-          eligibility: (if (($count|tonumber) > 0) then "READY" else "PHYSICAL_ACTION_REQUIRED" end),
-          blocker: (if (($count|tonumber) > 0) then "none" else "no external assessment Wi-Fi radio enumerated beyond wlan0" end),
-          management_interface:"wlan0",
-          management_driver:$wlan0_driver,
+          ready: ($assessment != null),
+          eligibility: (if ($assessment != null) then "VALIDATED" else "PHYSICAL_ACTION_REQUIRED" end),
+          blocker: (if ($assessment != null) then "none" else "approved external assessment Wi-Fi radio is not positively validated" end),
+          role_model:{management_radio:"wlan0",assessment_radio:(if ($assessment != null) then $assessment.interface else "none" end),nano_sidecar:"eth1"},
+          management_radio:{interface:"wlan0",driver:$wlan0_driver,phy:$wlan0_phy,mac:$wlan0_mac,is_default_route:($default_iface=="wlan0")},
           default_interface:$default_iface,
+          approved_identity:{usb_id:$approved_vidpid,driver:$approved_driver,mac:$approved_mac},
+          assessment_radio:$assessment,
           radios:$radios,
-          requirements:["second wireless device","distinct from wlan0","distinct phy","not default route","not management uplink","driver/chipset recordable"]
+          requirements:["second wireless device","distinct from wlan0","distinct phy","approved VID:PID","approved driver","not default route","not management uplink","driver/chipset recordable"]
         }'
-    rm -f "$rows"
 }
 
 watchdog_status_json() {
@@ -2539,13 +2640,18 @@ executor_gate_json() {
 }
 
 recovery_status_json() {
-    local status_json checkpoint_path recovery_state reason active lock_state checkpoint_status snapshot_valid decision
+    local status_json checkpoint_path recovery_state reason active lock_state checkpoint_status snapshot_valid decision service_state
     status_json="$(transition_status_values)"
     checkpoint_path="$(jq -r '.executor.last_checkpoint // "none"' <<<"$status_json")"
     active="$(jq -r '.transition.active' <<<"$status_json")"
     lock_state="$(jq -r '.lock.status' <<<"$status_json")"
     snapshot_valid="$(jq -r '.preflight.snapshot_valid' <<<"$status_json")"
     checkpoint_status="absent"
+    if [[ -f /etc/systemd/system/warpi-transition-recovery.service || -f /lib/systemd/system/warpi-transition-recovery.service ]]; then
+        service_state="installed"
+    else
+        service_state="not-installed"
+    fi
     decision="SAFE_IDLE"
     reason="transition state is idle and no lock is present"
     if [[ "$lock_state" != "absent" ]]; then
@@ -2569,8 +2675,26 @@ recovery_status_json() {
     [[ "$snapshot_valid" == "true" || "$decision" == "SAFE_IDLE" ]] || { decision="MANUAL_INTERVENTION_REQUIRED"; reason="$reason; valid rollback snapshot unavailable"; }
     jq -n --arg decision "$decision" --arg reason "$reason" --arg checkpoint "$checkpoint_path" \
         --arg checkpoint_status "$checkpoint_status" --arg active "$active" --arg lock "$lock_state" \
-        --arg snapshot_valid "$snapshot_valid" --arg service "not-installed" \
+        --arg snapshot_valid "$snapshot_valid" --arg service "$service_state" \
         '{schema_version:1, decision:$decision, reason:$reason, active_transition:($active=="YES"), lock_status:$lock, checkpoint_path:$checkpoint, checkpoint_status:$checkpoint_status, rollback_snapshot_valid:($snapshot_valid=="true"), boot_policy:"do-not-resume-forward-field-transition", systemd_recovery_service:$service, live_mutation_permitted:false}'
+}
+
+recovery_record_status() {
+    local recovery status_file arm_file status_dir
+    recovery="$(recovery_status_json)"
+    status_file="$EXECUTOR_RECOVERY_STATUS_FILE"
+    status_dir="$(dirname "$status_file")"
+    arm_file="$EXECUTOR_ARM_FILE"
+    mkdir -p "$status_dir"
+    chmod 755 "$status_dir" 2>/dev/null || true
+    if [[ -e "$arm_file" ]]; then
+        rm -f -- "$arm_file"
+        recovery="$(jq '. + {stale_authorization_cleared:true}' <<<"$recovery")"
+    else
+        recovery="$(jq '. + {stale_authorization_cleared:false}' <<<"$recovery")"
+    fi
+    jq --arg recorded_at "$(utc_now)" '. + {recorded_at:$recorded_at, recovery_service_mode:"status-only-no-live-mutation"}' <<<"$recovery" | atomic_write_json "$status_file" 640 root "$(transition_read_group)"
+    jq '.' "$status_file"
 }
 
 executor_status() {
@@ -2622,6 +2746,10 @@ recovery_status() {
             fi
             exec sudo -n "$0" mode recovery-status
         fi
+    fi
+    if [[ "$format" == "record" || "$format" == "--record" ]]; then
+        recovery_record_status
+        return
     fi
     recovery="$(recovery_status_json)"
     if [[ "$format" == "json" || "$format" == "--json" ]]; then jq '.' <<<"$recovery"; return; fi
@@ -3263,7 +3391,10 @@ wireless_status() {
     local ping_status tcp_status nm_state nm_connection wireless_actions
 
     link_state="$(ip -br link show "$interface" 2>/dev/null | awk '{print $2}' || true)"
-    addr="$(ip -br addr show "$interface" 2>/dev/null | awk '{print $3}' || true)"
+    addr="$(ip -4 -br addr show "$interface" 2>/dev/null | awk '{print $3}' || true)"
+    if [[ -z "$addr" ]]; then
+        addr="$(ip -br addr show "$interface" 2>/dev/null | awk '{print $3}' || true)"
+    fi
     route="$(ip route get "$host" 2>/dev/null | head -n 1 || true)"
     default_route="$(ip route show default 2>/dev/null | head -n 1 || true)"
     default_iface="$(awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' <<<"$default_route" | head -n 1)"
@@ -3432,6 +3563,7 @@ case "${1:-help}" in
 	                case "${3:-}" in
 	                    ""|--human) recovery_status human ;;
 	                    --json) recovery_status json ;;
+	                    --record) recovery_status record ;;
 	                    *) echo "Unknown recovery-status option: $3" >&2; exit 2 ;;
 	                esac
 	                ;;
@@ -3462,7 +3594,11 @@ case "${1:-help}" in
                         mode_enter_field_plan
                         ;;
 	                    --apply)
-	                        echo "warpi mode enter-field --apply is refused: live executor disabled; operator authorization absent; external assessment Wi-Fi is not enumerated; staged live tests are not approved." >&2
+	                        if [[ "$(executor_external_wifi_json 2>/dev/null | jq -r '.ready // false' 2>/dev/null)" == "true" ]]; then
+	                            echo "warpi mode enter-field --apply is refused: live executor disabled; operator authorization absent; first staged live test is not approved." >&2
+	                        else
+	                            echo "warpi mode enter-field --apply is refused: live executor disabled; operator authorization absent; external assessment Wi-Fi is not validated; staged live tests are not approved." >&2
+	                        fi
 	                        exit 2
                         ;;
                     *)
