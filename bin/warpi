@@ -15,6 +15,7 @@ TRANSITION_CURRENT_FILE="${TRANSITION_CURRENT_FILE:-/run/warpi/mode-transition-c
 TRANSITION_RECOVERY_DIR="${TRANSITION_RECOVERY_DIR:-/var/lib/warpi/mode-transitions}"
 TRANSITION_ROLLBACK_FILE="${TRANSITION_ROLLBACK_FILE:-/var/lib/warpi/mode-transitions/rollback-plan.json}"
 TRANSITION_PENDING_FILE="${TRANSITION_PENDING_FILE:-/var/lib/warpi/mode-transitions/pending-transition.json}"
+TRANSITION_LAST_PREFLIGHT_FILE="${TRANSITION_LAST_PREFLIGHT_FILE:-/var/lib/warpi/mode-transitions/last-preflight.json}"
 TRANSITION_APPLY_GATE="apply mode is disabled until transaction execution, rollback, boot recovery, and staged live tests are approved"
 
 config_value() {
@@ -69,6 +70,8 @@ Usage:
   warpi status
   warpi mode status
   warpi mode transition-status
+  warpi mode preflight enter-field
+  warpi mode preflight return-normal
   warpi mode enter-field
   warpi mode return-normal
   warpi wireless status
@@ -83,6 +86,10 @@ Commands:
   mode status       Show current NORMAL/FIELD mode state.
   mode transition-status
                     Show read-only mode-transition state, lock, and rollback status.
+  mode preflight enter-field
+                    Capture a non-mutating rollback snapshot for a future Field transition.
+  mode preflight return-normal
+                    Capture a non-mutating rollback snapshot for a future Normal return.
   mode enter-field  Show the Field Mode transition plan without changing state.
   mode return-normal Show the Normal Mode transition plan without changing state.
   wireless status   Show read-only WiFi Pineapple NANO sidecar reachability.
@@ -94,6 +101,7 @@ Commands:
 Mode switching:
   enter-field and return-normal are dry-run only. Apply mode is intentionally not enabled yet.
   transition-status is read-only and supports --json for machine-readable output.
+  preflight commands create rollback-snapshot metadata but do not change network state or mode.
 
 Wireless:
   wireless status is read-only. It does not start scans, change radios, or modify NANO state.
@@ -126,6 +134,10 @@ transition_rollback_file() {
 
 transition_pending_file() {
     printf '%s\n' "${WARPI_TRANSITION_PENDING_FILE:-$TRANSITION_PENDING_FILE}"
+}
+
+transition_last_preflight_file() {
+    printf '%s\n' "${WARPI_TRANSITION_LAST_PREFLIGHT_FILE:-$TRANSITION_LAST_PREFLIGHT_FILE}"
 }
 
 transition_state_allowed() {
@@ -184,18 +196,22 @@ transition_json_value() {
 transition_status_values() {
     require_state
 
-    local lock_file state_file current_file rollback_file pending_file
+    local lock_file state_file current_file rollback_file pending_file last_preflight_file
     local mode state_file_status current_file_status rollback_status pending_status lock_status
     local transition_state transition_active direction transition_id source_mode target_mode
     local started_at updated_at completed_at failure_reason rollback_available
     local last_attempted last_completed last_result last_event validation_status blockers
     local apply_prereqs apply_eligible unsafe_reasons lock_detail
+    local last_preflight_status last_preflight_id last_preflight_direction last_preflight_result
+    local last_preflight_snapshot_path last_preflight_snapshot_valid last_preflight_blocker_count
+    local last_preflight_warning_count last_preflight_completed_at last_preflight_stale
 
     lock_file="$(transition_lock_file)"
     state_file="$(transition_state_file)"
     current_file="$(transition_current_file)"
     rollback_file="$(transition_rollback_file)"
     pending_file="$(transition_pending_file)"
+    last_preflight_file="$(transition_last_preflight_file)"
     mode="$(json_value '.mode')"
 
     lock_status="$(transition_file_status "$lock_file")"
@@ -203,6 +219,7 @@ transition_status_values() {
     current_file_status="$(transition_file_status "$current_file")"
     rollback_status="$(transition_file_status "$rollback_file")"
     pending_status="$(transition_file_status "$pending_file")"
+    last_preflight_status="$(transition_file_status "$last_preflight_file")"
 
     transition_state="IDLE"
     transition_active="NO"
@@ -223,6 +240,15 @@ transition_status_values() {
     blockers="none"
     unsafe_reasons=""
     lock_detail="none"
+    last_preflight_id="none"
+    last_preflight_direction="none"
+    last_preflight_result="none"
+    last_preflight_snapshot_path="none"
+    last_preflight_snapshot_valid="NO"
+    last_preflight_blocker_count="0"
+    last_preflight_warning_count="0"
+    last_preflight_completed_at="none"
+    last_preflight_stale="unknown"
 
     if [[ "$lock_status" == "unsafe-symlink" ]]; then
         unsafe_reasons="${unsafe_reasons}lock path is a symlink; "
@@ -233,6 +259,25 @@ transition_status_values() {
 
     if [[ "$state_file_status" == "unsafe-symlink" || "$current_file_status" == "unsafe-symlink" ]]; then
         unsafe_reasons="${unsafe_reasons}transition metadata path is a symlink; "
+    fi
+    if [[ "$last_preflight_status" == "unsafe-symlink" ]]; then
+        unsafe_reasons="${unsafe_reasons}last preflight path is a symlink; "
+        validation_status="unsafe"
+    elif [[ "$last_preflight_status" == "present" ]]; then
+        if jq -e . "$last_preflight_file" >/dev/null 2>&1; then
+            last_preflight_id="$(transition_json_value "$last_preflight_file" '.transition_id' 'none')"
+            last_preflight_direction="$(transition_json_value "$last_preflight_file" '.transition_direction' 'none')"
+            last_preflight_result="$(transition_json_value "$last_preflight_file" '.validation_result' 'none')"
+            last_preflight_snapshot_path="$(transition_json_value "$last_preflight_file" '.snapshot_path' 'none')"
+            last_preflight_snapshot_valid="$(transition_json_value "$last_preflight_file" '.rollback_snapshot_valid' 'false')"
+            last_preflight_blocker_count="$(transition_json_value "$last_preflight_file" '.blocker_count' '0')"
+            last_preflight_warning_count="$(transition_json_value "$last_preflight_file" '.warning_count' '0')"
+            last_preflight_completed_at="$(transition_json_value "$last_preflight_file" '.completed_at' 'none')"
+            last_preflight_stale="$(transition_json_value "$last_preflight_file" '.stale' 'false')"
+        else
+            unsafe_reasons="${unsafe_reasons}last preflight JSON is malformed; "
+            validation_status="unsafe"
+        fi
     fi
 
     if [[ "$state_file_status" == "present" ]]; then
@@ -354,6 +399,17 @@ transition_status_values() {
         --arg rollback_file "$rollback_file" \
         --arg pending_status "$pending_status" \
         --arg pending_file "$pending_file" \
+        --arg last_preflight_status "$last_preflight_status" \
+        --arg last_preflight_file "$last_preflight_file" \
+        --arg last_preflight_id "$last_preflight_id" \
+        --arg last_preflight_direction "$last_preflight_direction" \
+        --arg last_preflight_result "$last_preflight_result" \
+        --arg last_preflight_snapshot_path "$last_preflight_snapshot_path" \
+        --arg last_preflight_snapshot_valid "$last_preflight_snapshot_valid" \
+        --arg last_preflight_blocker_count "$last_preflight_blocker_count" \
+        --arg last_preflight_warning_count "$last_preflight_warning_count" \
+        --arg last_preflight_completed_at "$last_preflight_completed_at" \
+        --arg last_preflight_stale "$last_preflight_stale" \
         --arg rollback_available "$rollback_available" \
         --arg validation_status "$validation_status" \
         --arg blockers "$blockers" \
@@ -389,6 +445,19 @@ transition_status_values() {
             current_transaction_path: $current_file,
             pending_path: $pending_file,
             pending_status: $pending_status
+          },
+          preflight: {
+            status: $last_preflight_status,
+            path: $last_preflight_file,
+            last_transaction_id: $last_preflight_id,
+            last_direction: $last_preflight_direction,
+            last_result: $last_preflight_result,
+            snapshot_path: $last_preflight_snapshot_path,
+            snapshot_valid: $last_preflight_snapshot_valid,
+            blocker_count: $last_preflight_blocker_count,
+            warning_count: $last_preflight_warning_count,
+            completed_at: $last_preflight_completed_at,
+            stale: $last_preflight_stale
           },
           rollback: {
             available: $rollback_available,
@@ -440,6 +509,17 @@ transition_status() {
     printf "%-32s %s\n" "Rollback available:" "$(jq -r '.rollback.available' <<<"$status_json")"
     printf "%-32s %s\n" "Rollback metadata path:" "$(jq -r '.rollback.path' <<<"$status_json")"
     echo
+    printf "%-32s %s\n" "Last preflight:" "$(jq -r '.preflight.status' <<<"$status_json")"
+    printf "%-32s %s\n" "Last preflight ID:" "$(jq -r '.preflight.last_transaction_id' <<<"$status_json")"
+    printf "%-32s %s\n" "Last preflight direction:" "$(jq -r '.preflight.last_direction' <<<"$status_json")"
+    printf "%-32s %s\n" "Last preflight result:" "$(jq -r '.preflight.last_result' <<<"$status_json")"
+    printf "%-32s %s\n" "Snapshot valid:" "$(jq -r '.preflight.snapshot_valid' <<<"$status_json")"
+    printf "%-32s %s\n" "Snapshot path:" "$(jq -r '.preflight.snapshot_path' <<<"$status_json")"
+    printf "%-32s %s\n" "Preflight blockers:" "$(jq -r '.preflight.blocker_count' <<<"$status_json")"
+    printf "%-32s %s\n" "Preflight warnings:" "$(jq -r '.preflight.warning_count' <<<"$status_json")"
+    printf "%-32s %s\n" "Preflight completed:" "$(jq -r '.preflight.completed_at' <<<"$status_json")"
+    printf "%-32s %s\n" "Preflight stale:" "$(jq -r '.preflight.stale' <<<"$status_json")"
+    echo
     printf "%-32s %s\n" "Validation status:" "$(jq -r '.validation.status' <<<"$status_json")"
     printf "%-32s %s\n" "Future apply eligible:" "$(jq -r '.validation.future_apply_eligible' <<<"$status_json")"
     printf "%-32s %s\n" "Future apply prerequisites:" "$(jq -r '.validation.future_apply_prerequisites' <<<"$status_json")"
@@ -475,6 +555,669 @@ transition_dry_run_summary() {
     printf "%-22s %s\n" "Future apply:" "$eligible"
     printf "%-22s %s\n" "Blockers:" "$blockers"
     echo "Dry run does not create, update, or clear transition metadata."
+}
+
+transition_recovery_dir() {
+    printf '%s\n' "${WARPI_TRANSITION_RECOVERY_DIR:-$TRANSITION_RECOVERY_DIR}"
+}
+
+transition_read_group() {
+    if getent group kernel-agent >/dev/null 2>&1; then
+        echo "kernel-agent"
+    else
+        echo "root"
+    fi
+}
+
+utc_now() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+generate_transition_id() {
+    printf 'tx-%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+require_json_object_file() {
+    local path="$1"
+
+    [[ -f "$path" ]] && jq -e 'type == "object"' "$path" >/dev/null 2>&1
+}
+
+ensure_control_path() {
+    local path="$1"
+    local parent
+
+    parent="$(dirname "$path")"
+    if [[ -L "$path" || -L "$parent" ]]; then
+        echo "unsafe symlink path: $path" >&2
+        return 1
+    fi
+}
+
+atomic_write_json() {
+    local path="$1"
+    local mode="${2:-600}"
+    local owner="${3:-root}"
+    local group="${4:-root}"
+    local parent tmp
+
+    parent="$(dirname "$path")"
+    ensure_control_path "$path"
+    if [[ ! -d "$parent" ]]; then
+        install -d -o "$owner" -g "$group" -m 750 "$parent"
+    fi
+    tmp="$(mktemp "$parent/.${path##*/}.XXXXXX")"
+    cat > "$tmp"
+    jq -e . "$tmp" >/dev/null
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        install -o "$owner" -g "$group" -m "$mode" "$tmp" "$path"
+    else
+        install -m "$mode" "$tmp" "$path"
+    fi
+    rm -f "$tmp"
+}
+
+preflight_add_finding() {
+    local file="$1"
+    local level="$2"
+    local code="$3"
+    local message="$4"
+
+    jq -nc --arg level "$level" --arg code "$code" --arg message "$message" \
+        '{level: $level, code: $code, message: $message}' >> "$file"
+}
+
+preflight_count_findings() {
+    local file="$1"
+    local level="$2"
+
+    if [[ ! -s "$file" ]]; then
+        echo 0
+        return
+    fi
+    jq -s --arg level "$level" '[.[] | select(.level == $level)] | length' "$file"
+}
+
+preflight_findings_json() {
+    local file="$1"
+
+    if [[ ! -s "$file" ]]; then
+        echo '[]'
+        return
+    fi
+    jq -s '.' "$file"
+}
+
+command_json_or_empty() {
+    "$@" 2>/dev/null || true
+}
+
+command_text_or_empty() {
+    "$@" 2>/dev/null || true
+}
+
+transition_preflight_paths() {
+    local transition_id="$1"
+    local recovery_dir
+
+    recovery_dir="$(transition_recovery_dir)"
+    printf '%s/%s\n' "$recovery_dir" "$transition_id"
+}
+
+transition_acquire_lock() {
+    local transition_id="$1"
+    local operation="$2"
+    local lock_file
+
+    lock_file="$(transition_lock_file)"
+    ensure_control_path "$lock_file"
+    if [[ ! -d "$(dirname "$lock_file")" ]]; then
+        install -d -o root -g root -m 755 "$(dirname "$lock_file")"
+    fi
+    if ( set -o noclobber; printf 'transition_id=%s operation=%s pid=%s started_at=%s\n' "$transition_id" "$operation" "$$" "$(utc_now)" > "$lock_file" ) 2>/dev/null; then
+        chmod 600 "$lock_file"
+        return 0
+    fi
+    return 1
+}
+
+transition_release_lock() {
+    local transition_id="$1"
+    local lock_file
+    lock_file="$(transition_lock_file)"
+
+    if [[ -f "$lock_file" ]] && grep -q "transition_id=$transition_id" "$lock_file" 2>/dev/null; then
+        rm -f "$lock_file"
+    fi
+}
+
+transition_write_state() {
+    local state="$1"
+    local transition_id="$2"
+    local direction="$3"
+    local source_mode="$4"
+    local target_mode="$5"
+    local started_at="$6"
+    local completed_at="${7:-none}"
+    local result="${8:-in-progress}"
+    local state_file current_file
+
+    state_file="$(transition_state_file)"
+    current_file="$(transition_current_file)"
+    jq -n \
+        --arg state "$state" \
+        --arg transition_id "$transition_id" \
+        --arg direction "$direction" \
+        --arg source_mode "$source_mode" \
+        --arg target_mode "$target_mode" \
+        --arg started_at "$started_at" \
+        --arg updated_at "$(utc_now)" \
+        --arg completed_at "$completed_at" \
+        --arg result "$result" \
+        '{
+          state: $state,
+          direction: $direction,
+          transition_id: $transition_id,
+          source_mode: $source_mode,
+          target_mode: $target_mode,
+          started_at: $started_at,
+          updated_at: $updated_at,
+          completed_at: $completed_at,
+          failure_reason: "none",
+          rollback_available: false,
+          last_attempted_transition: $direction,
+          last_completed_transition: (if $state == "IDLE" then $direction else "none" end),
+          last_result: $result,
+          last_event_at: $updated_at
+        }' | atomic_write_json "$state_file" 640 root "$(transition_read_group)"
+
+    if [[ "$state" == "IDLE" ]]; then
+        rm -f "$current_file"
+    else
+        jq -n \
+            --arg transition_id "$transition_id" \
+            --arg operation_type "preflight" \
+            --arg direction "$direction" \
+            --arg source_mode "$source_mode" \
+            --arg target_mode "$target_mode" \
+            --arg state "$state" \
+            --arg started_at "$started_at" \
+            --arg updated_at "$(utc_now)" \
+            '{
+              transition_id: $transition_id,
+              operation_type: $operation_type,
+              direction: $direction,
+              source_mode: $source_mode,
+              target_mode: $target_mode,
+              state: $state,
+              started_at: $started_at,
+              updated_at: $updated_at
+            }' | atomic_write_json "$current_file" 640 root "$(transition_read_group)"
+    fi
+}
+
+preflight_capture_snapshot() {
+    local transition_id="$1"
+    local direction="$2"
+    local source_mode="$3"
+    local target_mode="$4"
+    local findings_file="$5"
+    local snapshot_path="$6"
+    local captured_at hostname os_name kernel_release architecture warpi_mode warpi_state
+    local wifi_profile wifi_ssid active_iface default_route default_iface dns_info nm_active
+    local tailscale_service tailscale_backend tailscale_ip ts_management
+    local nano_ping nano_ui default_uses_sidecar firewall_impl firewall_state
+    local root_percent available_kb extra_wifi
+    local warpi_kernel_state networkmanager_state ssh_state gpsd_state warpi_ui_state kismet_state
+    local field_marker_present addresses_json routes_json
+
+    captured_at="$(utc_now)"
+    hostname="$(hostname 2>/dev/null || echo unknown)"
+    os_name="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" || echo unknown)"
+    kernel_release="$(uname -r 2>/dev/null || echo unknown)"
+    architecture="$(uname -m 2>/dev/null || echo unknown)"
+    warpi_mode="$(json_value '.mode' 'unknown')"
+    warpi_state="$(json_value '.state' 'unknown')"
+    wifi_profile="$(json_value '.network.wifi_profile' 'unknown')"
+    wifi_ssid="$(json_value '.network.wifi_ssid' 'unknown')"
+    active_iface="$(json_value '.network.interface' 'unknown')"
+    default_route="$(ip route show default 2>/dev/null | head -n 1 || true)"
+    default_iface="$(awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' <<<"$default_route" | head -n 1)"
+    dns_info="$(command_text_or_empty resolvectl dns)"
+    nm_active="$(command_text_or_empty nmcli -t -f NAME,UUID,TYPE,DEVICE connection show --active)"
+    tailscale_service="$(systemctl is-active tailscaled.service 2>/dev/null || true)"
+    tailscale_backend="$(command_json_or_empty tailscale status --json | jq -r '.BackendState // "unknown"' 2>/dev/null || echo unknown)"
+    tailscale_ip="$(command_json_or_empty tailscale status --json | jq -r '.Self.TailscaleIPs[0] // "unknown"' 2>/dev/null || echo unknown)"
+    root_percent="$(df -P / | awk 'NR == 2 {print $5}' 2>/dev/null || echo unknown)"
+    available_kb="$(df -Pk / | awk 'NR == 2 {print $4}' 2>/dev/null || echo 0)"
+    warpi_kernel_state="$(systemctl is-active "$KERNEL_SERVICE" 2>/dev/null || true)"
+    networkmanager_state="$(systemctl is-active NetworkManager.service 2>/dev/null || true)"
+    ssh_state="$(systemctl is-active ssh.service 2>/dev/null || true)"
+    gpsd_state="$(systemctl is-active gpsd.service 2>/dev/null || true)"
+    warpi_ui_state="$(systemctl is-active warpi-ui.service 2>/dev/null || true)"
+    kismet_state="$(systemctl is-active kismet.service 2>/dev/null || true)"
+    field_marker_present="$([[ -e "$FIELD_MARKER" ]] && echo true || echo false)"
+    addresses_json="$(command_json_or_empty ip -j addr show)"
+    routes_json="$(command_json_or_empty ip -j route show)"
+    extra_wifi="$(find /sys/class/net -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | grep -E '^(wl|wlan)' | grep -v '^wlan0$' | head -n 1 || true)"
+
+    if ping -c 1 -W 2 "$NANO_HOST" >/dev/null 2>&1; then
+        nano_ping="true"
+    else
+        nano_ping="false"
+    fi
+    if timeout 4 bash -c ":</dev/tcp/$NANO_HOST/$NANO_UI_PORT" >/dev/null 2>&1; then
+        nano_ui="true"
+    else
+        nano_ui="false"
+    fi
+    if [[ "$default_iface" == "$NANO_INTERFACE" ]]; then
+        default_uses_sidecar="true"
+    else
+        default_uses_sidecar="false"
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        firewall_impl="nftables"
+        firewall_state="$(command_text_or_empty nft list tables)"
+    elif command -v iptables-save >/dev/null 2>&1; then
+        firewall_impl="iptables"
+        firewall_state="$(command_text_or_empty iptables-save -t filter | sed -n '1,80p')"
+    else
+        firewall_impl="unknown"
+        firewall_state=""
+    fi
+    if [[ "$tailscale_backend" == "Running" && "$tailscale_ip" != "unknown" ]]; then
+        ts_management="true"
+    else
+        ts_management="false"
+    fi
+
+    [[ "$warpi_mode" == "$source_mode" ]] || preflight_add_finding "$findings_file" "BLOCK" "source-mode-mismatch" "Live mode is $warpi_mode but requested source is $source_mode."
+    [[ -n "$default_route" ]] || preflight_add_finding "$findings_file" "BLOCK" "missing-default-route" "Default route is unavailable."
+    [[ -n "$default_iface" ]] || preflight_add_finding "$findings_file" "BLOCK" "missing-default-interface" "Default route interface could not be identified."
+    [[ "$ts_management" == "true" ]] || preflight_add_finding "$findings_file" "BLOCK" "tailscale-unavailable" "Tailscale management path is not visibly running."
+    [[ "$tailscale_service" == "active" ]] || preflight_add_finding "$findings_file" "BLOCK" "tailscale-service-inactive" "tailscaled.service is not active."
+    [[ "$warpi_kernel_state" == "active" ]] || preflight_add_finding "$findings_file" "BLOCK" "warpi-kernel-inactive" "$KERNEL_SERVICE is not active."
+    [[ "$networkmanager_state" == "active" ]] || preflight_add_finding "$findings_file" "BLOCK" "networkmanager-inactive" "NetworkManager.service is not active."
+    [[ "$ssh_state" == "active" ]] || preflight_add_finding "$findings_file" "BLOCK" "ssh-inactive" "ssh.service is not active."
+    [[ "$default_uses_sidecar" == "false" ]] || preflight_add_finding "$findings_file" "BLOCK" "sidecar-default-route" "Default route uses the sidecar interface."
+    [[ "$nano_ping" == "true" ]] || preflight_add_finding "$findings_file" "WARN" "nano-ping-unreachable" "NANO sidecar ping is not reachable."
+    [[ "$nano_ui" == "true" ]] || preflight_add_finding "$findings_file" "WARN" "nano-ui-unreachable" "NANO UI TCP port is not reachable."
+    [[ -e /sys/class/net/"$NANO_INTERFACE" ]] || preflight_add_finding "$findings_file" "WARN" "nano-interface-missing" "Configured NANO interface is not present."
+    [[ -n "$extra_wifi" ]] || preflight_add_finding "$findings_file" "WARN" "external-wifi-not-detected" "No additional wireless interface beyond wlan0 was detected."
+    [[ "${available_kb:-0}" -gt 102400 ]] || preflight_add_finding "$findings_file" "BLOCK" "low-root-disk-space" "Root filesystem has less than 100 MB available."
+
+    jq -n \
+        --arg schema_version "1" \
+        --arg transition_id "$transition_id" \
+        --arg captured_at "$captured_at" \
+        --arg source_mode "$source_mode" \
+        --arg target_mode "$target_mode" \
+        --arg direction "$direction" \
+        --arg hostname "$hostname" \
+        --arg os_name "$os_name" \
+        --arg kernel_release "$kernel_release" \
+        --arg architecture "$architecture" \
+        --arg warpi_mode "$warpi_mode" \
+        --arg warpi_state "$warpi_state" \
+        --arg field_marker "$FIELD_MARKER" \
+        --arg wifi_profile "$wifi_profile" \
+        --arg wifi_ssid "$wifi_ssid" \
+        --arg active_iface "$active_iface" \
+        --arg default_route "$default_route" \
+        --arg default_iface "$default_iface" \
+        --arg dns_info "$dns_info" \
+        --arg nm_active "$nm_active" \
+        --arg tailscale_service "$tailscale_service" \
+        --arg tailscale_backend "$tailscale_backend" \
+        --arg tailscale_ip "$tailscale_ip" \
+        --arg ts_management "$ts_management" \
+        --arg firewall_impl "$firewall_impl" \
+        --arg firewall_state "$firewall_state" \
+        --arg nano_interface "$NANO_INTERFACE" \
+        --arg nano_host "$NANO_HOST" \
+        --arg nano_port "$NANO_UI_PORT" \
+        --arg nano_ping "$nano_ping" \
+        --arg nano_ui "$nano_ui" \
+        --arg default_uses_sidecar "$default_uses_sidecar" \
+        --arg root_percent "$root_percent" \
+        --arg state_file "$STATE_FILE" \
+        --arg warpi_kernel_state "$warpi_kernel_state" \
+        --arg networkmanager_state "$networkmanager_state" \
+        --arg ssh_state "$ssh_state" \
+        --arg gpsd_state "$gpsd_state" \
+        --arg warpi_ui_state "$warpi_ui_state" \
+        --arg kismet_state "$kismet_state" \
+        --arg field_marker_present "$field_marker_present" \
+        --argjson addresses "${addresses_json:-[]}" \
+        --argjson routes "${routes_json:-[]}" \
+        '{
+          schema_version: ($schema_version | tonumber),
+          transition_id: $transition_id,
+          captured_at: $captured_at,
+          source_mode: $source_mode,
+          target_mode: $target_mode,
+          transition_direction: $direction,
+          system: {
+            hostname: $hostname,
+            os: $os_name,
+            kernel: $kernel_release,
+            architecture: $architecture,
+            root_disk_used_percent: $root_percent
+          },
+          warpi: {
+            mode: $warpi_mode,
+            state: $warpi_state,
+            state_file: $state_file,
+            field_marker_path: $field_marker,
+            field_marker_present: ($field_marker_present == "true")
+          },
+          network: {
+            manager: "NetworkManager",
+            active_connection: $wifi_profile,
+            ssid: $wifi_ssid,
+            interface: $active_iface,
+            addresses: $addresses,
+            default_route: $default_route,
+            default_interface: $default_iface,
+            relevant_routes: $routes,
+            dns: $dns_info,
+            active_connections: $nm_active
+          },
+          tailscale: {
+            service_state: $tailscale_service,
+            backend_state: $tailscale_backend,
+            tailnet_ip: $tailscale_ip,
+            management_path_present: ($ts_management == "true")
+          },
+          firewall: {
+            implementation: $firewall_impl,
+            snapshot_reference_or_safe_state: $firewall_state
+          },
+          services: {
+            warpi_kernel: $warpi_kernel_state,
+            tailscaled: $tailscale_service,
+            networkmanager: $networkmanager_state,
+            ssh: $ssh_state,
+            gpsd: $gpsd_state,
+            warpi_ui: $warpi_ui_state,
+            kismet: $kismet_state
+          },
+          sidecar: {
+            interface: $nano_interface,
+            management_path: $nano_host,
+            ui_port: ($nano_port | tonumber),
+            nano_reachable: ($nano_ping == "true"),
+            ui_port_reachable: ($nano_ui == "true"),
+            default_route_uses_sidecar: ($default_uses_sidecar == "true")
+          },
+          validation: {
+            snapshot_complete: false,
+            missing_fields: [],
+            warnings: []
+          },
+          secret_exclusion: {
+            captured_credentials: false,
+            excluded: ["wifi_psk", "tailscale_auth_keys", "api_tokens", "private_keys", "pineapple_credentials", "environment_secrets"]
+          }
+        }' > "$snapshot_path"
+}
+
+preflight_validate_snapshot() {
+    local snapshot_path="$1"
+    local findings_file="$2"
+    local missing_file="$3"
+
+    : > "$missing_file"
+    require_json_object_file "$snapshot_path" || {
+        preflight_add_finding "$findings_file" "BLOCK" "snapshot-malformed" "Rollback snapshot is not valid JSON object."
+        return
+    }
+
+    local required=(
+        '.schema_version'
+        '.transition_id'
+        '.captured_at'
+        '.source_mode'
+        '.target_mode'
+        '.network.active_connection'
+        '.network.interface'
+        '.network.default_route'
+        '.network.addresses'
+        '.tailscale.service_state'
+        '.tailscale.tailnet_ip'
+        '.services.warpi_kernel'
+        '.services.ssh'
+        '.sidecar.default_route_uses_sidecar'
+    )
+    local expr
+    for expr in "${required[@]}"; do
+        if ! jq -e "$expr != null and $expr != \"\"" "$snapshot_path" >/dev/null; then
+            echo "$expr" >> "$missing_file"
+        fi
+    done
+
+    if [[ -s "$missing_file" ]]; then
+        preflight_add_finding "$findings_file" "BLOCK" "snapshot-incomplete" "Rollback snapshot is missing required fields."
+    fi
+
+    if jq -e '.. | strings | test("(?i)(BEGIN .*PRIVATE|PRIVATE KEY|Authorization:|Bearer |password=|psk=|token=|secret=)")' "$snapshot_path" >/dev/null; then
+        preflight_add_finding "$findings_file" "BLOCK" "snapshot-secret-pattern" "Rollback snapshot contains a credential-like pattern."
+    fi
+}
+
+transition_preflight() {
+    local action="$1"
+    local output_format="${2:-human}"
+    local source_mode target_mode direction live_mode transition_id started_at completed_at tx_dir
+    local findings_file missing_file snapshot_tmp snapshot_path summary_path transaction_path
+    local blockers warnings validation_result snapshot_valid snapshot_complete apply_eligible stale
+
+    require_state
+
+    case "$action" in
+        enter-field)
+            source_mode="NORMAL"
+            target_mode="FIELD"
+            direction="NORMAL_TO_FIELD"
+            ;;
+        return-normal)
+            source_mode="FIELD"
+            target_mode="NORMAL"
+            direction="FIELD_TO_NORMAL"
+            ;;
+        *)
+            echo "Unknown preflight command: $action" >&2
+            echo "Try: warpi mode preflight enter-field" >&2
+            exit 2
+            ;;
+    esac
+
+    if [[ "${EUID:-$(id -u)}" -ne 0 && "$(transition_recovery_dir)" != /tmp/* ]]; then
+        if sudo -n true 2>/dev/null; then
+            if [[ "$output_format" == "json" || "$output_format" == "--json" ]]; then
+                exec sudo -n "$0" mode preflight "$action" --json
+            fi
+            exec sudo -n "$0" mode preflight "$action"
+        fi
+        echo "warpi mode preflight requires root or passwordless sudo for protected metadata writes." >&2
+        exit 1
+    fi
+
+    live_mode="$(json_value '.mode' 'unknown')"
+    transition_id="$(generate_transition_id)"
+    started_at="$(utc_now)"
+    tx_dir="$(transition_preflight_paths "$transition_id")"
+    findings_file="$(mktemp)"
+    missing_file="$(mktemp)"
+    snapshot_tmp="$(mktemp)"
+    snapshot_path="$tx_dir/rollback-snapshot.json"
+    transaction_path="$tx_dir/transaction.json"
+    summary_path="$(transition_last_preflight_file)"
+    mkdir -p "$tx_dir"
+    chown root:"$(transition_read_group)" "$tx_dir" 2>/dev/null || true
+    chmod 750 "$tx_dir"
+
+    if ! transition_acquire_lock "$transition_id" "preflight-$action"; then
+        preflight_add_finding "$findings_file" "BLOCK" "transition-lock-present" "A transition lock already exists; refusing conflicting preflight."
+        completed_at="$(utc_now)"
+        validation_result="BLOCK"
+        blockers="$(preflight_count_findings "$findings_file" "BLOCK")"
+        warnings="$(preflight_count_findings "$findings_file" "WARN")"
+        jq -n \
+            --arg transition_id "$transition_id" \
+            --arg direction "$direction" \
+            --arg source_mode "$source_mode" \
+            --arg target_mode "$target_mode" \
+            --arg started_at "$started_at" \
+            --arg completed_at "$completed_at" \
+            --arg validation_result "$validation_result" \
+            --arg blockers "$blockers" \
+            --arg warnings "$warnings" \
+            --argjson findings "$(preflight_findings_json "$findings_file")" \
+            '{schema_version: 1, transition_id: $transition_id, operation_type: "preflight", transition_direction: $direction, source_mode: $source_mode, target_mode: $target_mode, state: "FAILED", started_at: $started_at, completed_at: $completed_at, validation_result: $validation_result, blocker_count: ($blockers|tonumber), warning_count: ($warnings|tonumber), rollback_snapshot_present: false, rollback_snapshot_valid: false, apply_eligible: false, failure_reason: "transition lock exists", findings: $findings}' |
+            atomic_write_json "$summary_path" 640 root "$(transition_read_group)"
+        transition_preflight_report "$summary_path" "$output_format"
+        exit 2
+    fi
+    trap "transition_release_lock '$transition_id'; rm -f '$findings_file' '$missing_file' '$snapshot_tmp'" EXIT
+
+    transition_write_state "PREPARING" "$transition_id" "$direction" "$source_mode" "$target_mode" "$started_at"
+    transition_write_state "VALIDATING" "$transition_id" "$direction" "$source_mode" "$target_mode" "$started_at"
+
+    local status_json transition_active transition_validation
+    status_json="$(transition_status_values)"
+    transition_active="$(jq -r '.transition.active' <<<"$status_json")"
+    transition_validation="$(jq -r '.validation.status' <<<"$status_json")"
+    [[ "$live_mode" == "$source_mode" ]] || preflight_add_finding "$findings_file" "BLOCK" "live-mode-mismatch" "Live mode is $live_mode but requested source is $source_mode."
+    [[ "$transition_validation" != "unsafe" ]] || preflight_add_finding "$findings_file" "BLOCK" "transition-framework-unsafe" "Transition framework reports unsafe metadata."
+    [[ "$transition_active" == "YES" ]] || preflight_add_finding "$findings_file" "WARN" "preflight-lock-not-visible" "Preflight lock was not visible during validation."
+
+    transition_write_state "READY" "$transition_id" "$direction" "$source_mode" "$target_mode" "$started_at"
+    preflight_capture_snapshot "$transition_id" "$direction" "$source_mode" "$target_mode" "$findings_file" "$snapshot_tmp"
+    preflight_validate_snapshot "$snapshot_tmp" "$findings_file" "$missing_file"
+
+    blockers="$(preflight_count_findings "$findings_file" "BLOCK")"
+    warnings="$(preflight_count_findings "$findings_file" "WARN")"
+    if [[ "$blockers" -eq 0 ]]; then
+        validation_result="PASS"
+        snapshot_valid="true"
+        snapshot_complete="true"
+    else
+        validation_result="BLOCK"
+        snapshot_valid="false"
+        snapshot_complete="false"
+    fi
+    apply_eligible="false"
+    stale="false"
+    completed_at="$(utc_now)"
+
+    jq \
+        --argjson complete "$snapshot_complete" \
+        --argjson missing "$(jq -R -s 'split("\n") | map(select(length > 0))' "$missing_file")" \
+        --argjson warnings_json "$(jq -s '[.[] | select(.level == "WARN")]' "$findings_file")" \
+        '.validation.snapshot_complete = $complete | .validation.missing_fields = $missing | .validation.warnings = $warnings_json' \
+        "$snapshot_tmp" | atomic_write_json "$snapshot_path" 640 root "$(transition_read_group)"
+
+    jq -n \
+        --arg transition_id "$transition_id" \
+        --arg direction "$direction" \
+        --arg source_mode "$source_mode" \
+        --arg target_mode "$target_mode" \
+        --arg started_at "$started_at" \
+        --arg completed_at "$completed_at" \
+        --arg validation_result "$validation_result" \
+        --arg blockers "$blockers" \
+        --arg warnings "$warnings" \
+        --arg snapshot_path "$snapshot_path" \
+        --arg transaction_path "$transaction_path" \
+        --arg snapshot_valid "$snapshot_valid" \
+        --arg stale "$stale" \
+        --arg apply_gate "$TRANSITION_APPLY_GATE" \
+        --argjson findings "$(preflight_findings_json "$findings_file")" \
+        '{
+          schema_version: 1,
+          transition_id: $transition_id,
+          operation_type: "preflight",
+          state: "COMPLETED",
+          transition_direction: $direction,
+          source_mode: $source_mode,
+          target_mode: $target_mode,
+          started_at: $started_at,
+          updated_at: $completed_at,
+          completed_at: $completed_at,
+          validation_result: $validation_result,
+          blockers: $findings,
+          blocker_count: ($blockers | tonumber),
+          warning_count: ($warnings | tonumber),
+          rollback_snapshot_present: true,
+          rollback_snapshot_valid: ($snapshot_valid == "true"),
+          snapshot_path: $snapshot_path,
+          transaction_path: $transaction_path,
+          apply_eligible: false,
+          apply_gate: $apply_gate,
+          stale: ($stale == "true"),
+          failure_reason: (if $validation_result == "PASS" then "none" else "validation blocked" end)
+        }' | atomic_write_json "$transaction_path" 640 root "$(transition_read_group)"
+
+    atomic_write_json "$summary_path" 640 root "$(transition_read_group)" < "$transaction_path"
+    transition_write_state "IDLE" "$transition_id" "$direction" "$source_mode" "$target_mode" "$started_at" "$completed_at" "preflight-$validation_result"
+    transition_release_lock "$transition_id"
+    transition_preflight_report "$transaction_path" "$output_format"
+}
+
+transition_preflight_report() {
+    local transaction_path="$1"
+    local output_format="${2:-human}"
+    local snapshot_path
+
+    if [[ "$output_format" == "--json" || "$output_format" == "json" ]]; then
+        jq '.' "$transaction_path"
+        return
+    fi
+
+    snapshot_path="$(jq -r '.snapshot_path // "none"' "$transaction_path")"
+    echo
+    echo "============================================================"
+    echo "              WARPi MODE PREFLIGHT"
+    echo "============================================================"
+    echo
+    echo "Non-mutating preflight. No network, route, service, mode, Tailscale, or NANO state was changed."
+    echo
+    printf "%-28s %s\n" "Transaction ID:" "$(jq -r '.transition_id' "$transaction_path")"
+    printf "%-28s %s\n" "Operation:" "$(jq -r '.operation_type' "$transaction_path")"
+    printf "%-28s %s\n" "Direction:" "$(jq -r '.transition_direction' "$transaction_path")"
+    printf "%-28s %s\n" "Source mode:" "$(jq -r '.source_mode' "$transaction_path")"
+    printf "%-28s %s\n" "Target mode:" "$(jq -r '.target_mode' "$transaction_path")"
+    printf "%-28s %s\n" "State:" "$(jq -r '.state' "$transaction_path")"
+    printf "%-28s %s\n" "Validation result:" "$(jq -r '.validation_result' "$transaction_path")"
+    printf "%-28s %s\n" "Blockers:" "$(jq -r '.blocker_count' "$transaction_path")"
+    printf "%-28s %s\n" "Warnings:" "$(jq -r '.warning_count' "$transaction_path")"
+    printf "%-28s %s\n" "Snapshot present:" "$(jq -r '.rollback_snapshot_present' "$transaction_path")"
+    printf "%-28s %s\n" "Snapshot valid:" "$(jq -r '.rollback_snapshot_valid' "$transaction_path")"
+    printf "%-28s %s\n" "Snapshot path:" "$snapshot_path"
+    printf "%-28s %s\n" "Started:" "$(jq -r '.started_at' "$transaction_path")"
+    printf "%-28s %s\n" "Completed:" "$(jq -r '.completed_at' "$transaction_path")"
+    printf "%-28s %s\n" "Future apply eligible:" "$(jq -r '.apply_eligible' "$transaction_path")"
+    printf "%-28s %s\n" "Apply gate:" "$(jq -r '.apply_gate' "$transaction_path")"
+    echo
+    echo "FINDINGS"
+    echo "------------------------------------------------------------"
+    if [[ "$(jq -r '.blockers | length' "$transaction_path")" -eq 0 ]]; then
+        echo "No validation findings."
+    else
+        jq -r '.blockers[] | "- [" + .level + "] " + .code + ": " + .message' "$transaction_path"
+    fi
+    echo
+    echo "SNAPSHOT CATEGORIES"
+    echo "------------------------------------------------------------"
+    if [[ -f "$snapshot_path" ]]; then
+        echo "system, warpi, network, tailscale, firewall, services, sidecar, validation, secret_exclusion"
+    else
+        echo "none"
+    fi
+    echo
+    echo "============================================================"
 }
 
 mode_status() {
@@ -814,6 +1557,33 @@ case "${1:-help}" in
                     *)
                         echo "Unknown transition-status option: $3" >&2
                         echo "Try: warpi mode transition-status" >&2
+                        exit 2
+                        ;;
+                esac
+                ;;
+            preflight)
+                case "${3:-}" in
+                    enter-field|return-normal)
+                        case "${4:-}" in
+                            ""|--human)
+                                transition_preflight "$3" "human"
+                                ;;
+                            --json)
+                                transition_preflight "$3" "json"
+                                ;;
+                            *)
+                                echo "Unknown preflight option: $4" >&2
+                                echo "Try: warpi mode preflight enter-field" >&2
+                                exit 2
+                                ;;
+                        esac
+                        ;;
+                    help|-h|--help)
+                        usage
+                        ;;
+                    *)
+                        echo "Unknown preflight command: ${3:-}" >&2
+                        echo "Try: warpi mode preflight enter-field" >&2
                         exit 2
                         ;;
                 esac

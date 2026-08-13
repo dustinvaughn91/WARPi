@@ -177,6 +177,56 @@ Milestone A transition directions:
 
 The dry-run planners for `warpi mode enter-field` and `warpi mode return-normal` display transition framework status but do not create, update, or delete transition metadata.
 
+## Milestone B Preflight And Rollback Snapshot
+
+Milestone B adds non-mutating preflight commands:
+
+- `warpi mode preflight enter-field`
+- `warpi mode preflight return-normal`
+
+Each preflight creates a unique transaction ID, acquires `/run/warpi/mode-transition.lock`, progresses only through non-mutating states, captures and validates rollback metadata, writes transaction history, releases the lock, and returns active transition status to `IDLE`.
+
+Preflight transaction lifecycle:
+
+1. `PREPARING`: transaction ID created and lock acquired.
+2. `VALIDATING`: current state, lock state, mode direction, services, connectivity, storage, and control paths are inspected.
+3. `READY`: rollback snapshot capture is allowed because no immediate block prevented metadata capture.
+4. `COMPLETED`: transaction metadata and snapshot are written, lock is released, and active transition state returns to `IDLE`.
+
+Preflight never enters `APPLYING`, `VERIFYING`, or `ROLLING_BACK`.
+
+Rollback snapshot storage:
+
+- Transaction directory: `/var/lib/warpi/mode-transitions/<transition-id>/`
+- Snapshot: `/var/lib/warpi/mode-transitions/<transition-id>/rollback-snapshot.json`
+- Transaction summary: `/var/lib/warpi/mode-transitions/<transition-id>/transaction.json`
+- Latest preflight pointer: `/var/lib/warpi/mode-transitions/last-preflight.json`
+
+Snapshot schema version 1 includes:
+
+- `schema_version`, `transition_id`, `captured_at`, `source_mode`, `target_mode`, and `transition_direction`
+- `system`: hostname, OS, kernel, architecture, and root disk use
+- `warpi`: mode/state, runtime state file, and field marker path/presence
+- `network`: NetworkManager identity, active connection/profile, SSID, active interface, addresses, default route, relevant routes, DNS, and active connections
+- `tailscale`: service state, backend state, tailnet IP, and management-path presence
+- `firewall`: implementation and a safe table/ruleset reference
+- `services`: `warpi-kernel`, `tailscaled`, `NetworkManager`, `ssh`, `gpsd`, `warpi-ui`, and `kismet` state
+- `sidecar`: NANO interface, management path, UI port, reachability, and whether default route uses the sidecar
+- `validation`: snapshot completeness, missing fields, and warnings
+- `secret_exclusion`: explicit confirmation that credential classes are excluded
+
+Snapshots must never include Wi-Fi PSKs, Tailscale auth keys, API tokens, private keys, Pineapple credentials, environment secrets, or unrelated credentials. Validation blocks snapshots that contain common credential-like patterns.
+
+Validation levels:
+
+- `PASS`: the check is satisfactory.
+- `WARN`: the condition should be reviewed but does not prevent metadata capture.
+- `BLOCK`: future apply must not proceed.
+
+Preflight success does not authorize apply. A preflight snapshot becomes stale when live mode, active Wi-Fi profile, IP/default route, interface inventory, reboot/runtime identity, or transition metadata changes materially. Milestone B records a `stale` field for future use; a later verifier must compare the snapshot to live state before any apply can be considered.
+
+The next milestone should be a non-mutating rollback verifier / recovery planner that consumes a saved rollback snapshot and calculates exactly what would need to change to restore the source state, without applying those changes.
+
 ## Future Runtime Mode State Machine
 
 Future live mode states:
