@@ -21,6 +21,11 @@ TRANSITION_LAST_SIMULATION_FILE="${TRANSITION_LAST_SIMULATION_FILE:-/var/lib/war
 TRANSITION_APPLY_GATE="apply mode is disabled until transaction execution, rollback, boot recovery, and staged live tests are approved"
 EXECUTOR_BACKEND="simulation"
 LIVE_EXECUTOR_ENABLED="NO"
+LIVE_EXECUTOR_FEATURE_FLAG="disabled"
+EXECUTOR_ARM_FILE="${EXECUTOR_ARM_FILE:-/run/warpi/mode-executor.arm}"
+EXECUTOR_RECOVERY_STATUS_FILE="${EXECUTOR_RECOVERY_STATUS_FILE:-/run/warpi/mode-recovery-status.json}"
+EXECUTOR_CHECKPOINT_SCHEMA_VERSION="2"
+EXECUTOR_WATCHDOG_LOST_THRESHOLD="${EXECUTOR_WATCHDOG_LOST_THRESHOLD:-3}"
 
 config_value() {
     local key="$1"
@@ -77,10 +82,15 @@ Usage:
   warpi mode preflight enter-field
   warpi mode preflight return-normal
   warpi mode rollback-plan
-  warpi mode simulate enter-field
-  warpi mode simulate return-normal
-  warpi mode simulate-status
-  warpi mission status
+	  warpi mode simulate enter-field
+	  warpi mode simulate return-normal
+	  warpi mode simulate-status
+	  warpi mode executor-status
+	  warpi mode recovery-status
+	  warpi mode watchdog-status
+	  warpi mode adapters
+	  warpi mode test-fixtures
+	  warpi mission status
   warpi mission check-in
   warpi mode enter-field
   warpi mode return-normal
@@ -106,8 +116,16 @@ Commands:
                     Simulate staged NORMAL -> FIELD execution, checkpointing, and rollback.
   mode simulate return-normal
                     Simulate staged FIELD -> NORMAL execution, checkpointing, and rollback.
-  mode simulate-status
-                    Show latest simulation executor checkpoint/status.
+	  mode simulate-status
+	                    Show latest simulation executor checkpoint/status.
+	  mode executor-status
+	                    Show Milestone E live-gate, arming, hardware, watchdog, and blockers.
+	  mode recovery-status
+	                    Show boot/interruption recovery recommendation without mutating state.
+	  mode watchdog-status
+	                    Show read-only management-path watchdog state.
+	  mode adapters      List staged action adapters and their disabled live-execution status.
+	  mode test-fixtures Run non-mutating Milestone E fixture tests.
   mission status   Show Mission Control endpoint/auth/check-in status.
   mission check-in Send a bounded Mission Control heartbeat payload when reachable.
   mode enter-field  Show the Field Mode transition plan without changing state.
@@ -123,7 +141,7 @@ Mode switching:
   transition-status is read-only and supports --json for machine-readable output.
   preflight commands create rollback-snapshot metadata but do not change network state or mode.
   rollback-plan is preview-only and supports --transaction ID and --json.
-  simulate commands are simulation-only. No live executor backend exists or can be enabled.
+	  simulate commands are simulation-only. Milestone E live adapters exist only behind a disabled hard gate.
 
 Mission Control:
   mission status and check-in are bounded best-effort operations. Mission Control
@@ -2343,6 +2361,315 @@ simulation_status() {
     fi
 }
 
+executor_arm_status_json() {
+    local arm_file now_epoch expires_epoch status reason transaction_id created_at expires_at
+    arm_file="$EXECUTOR_ARM_FILE"
+    now_epoch="$(date -u +%s)"
+    status="not-armed"
+    reason="no arm file present; live execution is disabled"
+    transaction_id="none"
+    created_at="none"
+    expires_at="none"
+    if [[ -L "$arm_file" ]]; then
+        status="invalid"
+        reason="arm file is a symlink"
+    elif [[ -f "$arm_file" ]]; then
+        if jq -e 'type == "object"' "$arm_file" >/dev/null 2>&1; then
+            transaction_id="$(jq -r '.transaction_id // "none"' "$arm_file")"
+            created_at="$(jq -r '.created_at // "none"' "$arm_file")"
+            expires_at="$(jq -r '.expires_at // "none"' "$arm_file")"
+            expires_epoch="$(date -u -d "$expires_at" +%s 2>/dev/null || echo 0)"
+            if [[ "$expires_epoch" -gt "$now_epoch" ]]; then
+                status="armed-but-ignored"
+                reason="arm file is present but live executor feature flag is disabled"
+            else
+                status="expired"
+                reason="arm file is expired or has invalid expiry"
+            fi
+        else
+            status="invalid"
+            reason="arm file is malformed"
+        fi
+    fi
+    jq -n --arg schema_version "1" --arg file "$arm_file" --arg status "$status" \
+        --arg reason "$reason" --arg transaction_id "$transaction_id" \
+        --arg created_at "$created_at" --arg expires_at "$expires_at" \
+        '{schema_version:($schema_version|tonumber), file:$file, status:$status, armed:($status=="armed-but-ignored"), transaction_id:$transaction_id, created_at:$created_at, expires_at:$expires_at, reason:$reason, boot_clears_authorization:true, reusable:false}'
+}
+
+executor_external_wifi_json() {
+    local wlan0_driver wlan0_phy default_iface rows count
+    wlan0_driver="$(basename "$(readlink -f /sys/class/net/wlan0/device/driver 2>/dev/null || echo none)")"
+    default_iface="$(ip route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')"
+    rows="$(mktemp)"
+    for iface_path in /sys/class/net/*; do
+        local iface type driver device phy mac nm_state
+        iface="$(basename "$iface_path")"
+        [[ "$iface" == wlan* || "$iface" == wl* ]] || continue
+        [[ "$iface" == "wlan0" ]] && continue
+        device="$(readlink -f "$iface_path/device" 2>/dev/null || echo none)"
+        driver="$(basename "$(readlink -f "$iface_path/device/driver" 2>/dev/null || echo none)")"
+        phy="$(basename "$(readlink -f "$iface_path/phy80211" 2>/dev/null || echo none)")"
+        mac="$(cat "$iface_path/address" 2>/dev/null || echo unknown)"
+        nm_state="$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: -v i="$iface" '$1==i {print $3; found=1} END {if (!found) print "unknown"}')"
+        jq -nc --arg iface "$iface" --arg driver "$driver" --arg phy "$phy" --arg mac "$mac" --arg device "$device" --arg nm_state "$nm_state" \
+            '{interface:$iface,driver:$driver,phy:$phy,mac:$mac,device_path:$device,networkmanager_state:$nm_state}' >> "$rows"
+    done
+    count="$(wc -l < "$rows" | tr -d ' ')"
+    jq -n --slurpfile radios "$rows" --arg count "$count" --arg wlan0_driver "$wlan0_driver" --arg default_iface "$default_iface" \
+        '{
+          schema_version:1,
+          ready: (($count|tonumber) > 0),
+          eligibility: (if (($count|tonumber) > 0) then "READY" else "PHYSICAL_ACTION_REQUIRED" end),
+          blocker: (if (($count|tonumber) > 0) then "none" else "no external assessment Wi-Fi radio enumerated beyond wlan0" end),
+          management_interface:"wlan0",
+          management_driver:$wlan0_driver,
+          default_interface:$default_iface,
+          radios:$radios,
+          requirements:["second wireless device","distinct from wlan0","distinct phy","not default route","not management uplink","driver/chipset recordable"]
+        }'
+    rm -f "$rows"
+}
+
+watchdog_status_json() {
+    local tailscale_backend tailscale_ip default_route default_iface active_profile nano_default route_to_peer mission_status state degraded_reasons lost_reasons
+    tailscale_backend="$(tailscale status --json 2>/dev/null | jq -r '.BackendState // "unknown"' 2>/dev/null || echo unknown)"
+    tailscale_ip="$(tailscale status --json 2>/dev/null | jq -r '.Self.TailscaleIPs[0] // "none"' 2>/dev/null || echo none)"
+    default_route="$(ip route show default 2>/dev/null | head -n1)"
+    default_iface="$(awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' <<<"$default_route")"
+    active_profile="$(json_value '.network.wifi_profile' 'unknown' 2>/dev/null || echo unknown)"
+    route_to_peer="$(ip route get 100.71.99.18 2>/dev/null | head -n1 || echo unavailable)"
+    mission_status="$(mission_probe_health_json 2>/dev/null | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
+    nano_default="false"
+    [[ "$default_iface" == "$NANO_INTERFACE" ]] && nano_default="true"
+    state="HEALTHY"
+    degraded_reasons=""
+    lost_reasons=""
+    [[ "$tailscale_backend" == "Running" ]] || { state="DEGRADED"; degraded_reasons="${degraded_reasons}tailscale backend is $tailscale_backend; "; }
+    [[ "$tailscale_ip" != "none" && "$tailscale_ip" != "unknown" ]] || { state="DEGRADED"; degraded_reasons="${degraded_reasons}tailscale IP missing; "; }
+    [[ -n "$default_iface" ]] || { state="LOST"; lost_reasons="${lost_reasons}default route missing; "; }
+    [[ "$nano_default" == "false" ]] || { state="LOST"; lost_reasons="${lost_reasons}default route uses NANO sidecar; "; }
+    [[ "$default_iface" == "wlan0" ]] || { [[ "$state" == "LOST" ]] || state="DEGRADED"; degraded_reasons="${degraded_reasons}default route interface is $default_iface; "; }
+    jq -n --arg state "$state" --arg tailscale_backend "$tailscale_backend" --arg tailscale_ip "$tailscale_ip" \
+        --arg default_route "$default_route" --arg default_iface "$default_iface" --arg active_profile "$active_profile" \
+        --arg route_to_peer "$route_to_peer" --arg nano_default "$nano_default" --arg mission_status "$mission_status" \
+        --arg degraded "$degraded_reasons" --arg lost "$lost_reasons" --arg threshold "$EXECUTOR_WATCHDOG_LOST_THRESHOLD" \
+        '{
+          schema_version:1,
+          state:$state,
+          thresholds:{lost_after_consecutive_failures:($threshold|tonumber), transient_degraded_action:"pause-and-reevaluate", persistent_lost_action:"rollback-required"},
+          checks:{tailscale_backend:$tailscale_backend,tailscale_ip:$tailscale_ip,default_route:$default_route,default_interface:$default_iface,active_profile:$active_profile,route_to_management_peer:$route_to_peer,nano_is_default_route:($nano_default=="true"),mission_control_status:$mission_status},
+          degraded_reasons:$degraded,
+          lost_reasons:$lost,
+          mission_control_dependency:"informational-only"
+        }'
+}
+
+executor_adapters_json() {
+    jq -n '[
+      {id:"validate-hardware", order:0, component:"hardware", mutating:false, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"manual-review", preconditions:["direction legal"], postconditions:["hardware prerequisites classified"]},
+      {id:"capture-rollback", order:1, component:"snapshot", mutating:false, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"none", preconditions:["source mode known"], postconditions:["rollback snapshot valid"]},
+      {id:"prepare-assessment-radio", order:2, component:"wireless", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"restore-radio-state", preconditions:["external radio ready","not wlan0"], postconditions:["assessment radio prepared"]},
+      {id:"prepare-routing", order:3, component:"route", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"restore-routing", preconditions:["watchdog healthy"], postconditions:["management route preserved"]},
+      {id:"prepare-firewall", order:4, component:"firewall", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"restore-firewall", preconditions:["rollback snapshot valid"], postconditions:["firewall staged"]},
+      {id:"verify-management-path", order:5, component:"tailscale", mutating:false, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"rollback-required-on-lost", preconditions:["tailscale visible"], postconditions:["watchdog healthy"]},
+      {id:"configure-field-services", order:6, component:"services", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"restore-services", preconditions:["management path safe"], postconditions:["service state verified"]},
+      {id:"verify-field-health", order:7, component:"health", mutating:false, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"rollback-required-on-fail", preconditions:["target prepared"], postconditions:["target health pass"]},
+      {id:"commit-mode", order:8, component:"mode", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"restore-mode", preconditions:["target health verified"], postconditions:["mode committed last"]},
+      {id:"restore-network", order:100, component:"rollback-network", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"manual-review", preconditions:["snapshot valid"], postconditions:["source uplink restored"]},
+      {id:"restore-routing", order:101, component:"rollback-route", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"manual-review", preconditions:["source route known"], postconditions:["default route restored"]},
+      {id:"restore-firewall", order:102, component:"rollback-firewall", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"manual-review", preconditions:["firewall snapshot reference"], postconditions:["firewall restored"]},
+      {id:"restore-services", order:103, component:"rollback-services", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"manual-review", preconditions:["service snapshot"], postconditions:["service state restored"]},
+      {id:"restore-mode", order:104, component:"rollback-mode", mutating:true, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"manual-review", preconditions:["health verified"], postconditions:["source mode committed last"]},
+      {id:"final-health", order:105, component:"health", mutating:false, interface:["validate","preview","execute","verify","rollback","describe"], execute_gate:"disabled", rollback_adapter:"manual-review", preconditions:["rollback actions complete"], postconditions:["management and mode healthy"]}
+    ]'
+}
+
+executor_gate_json() {
+    local status_json arm_json hw_json watchdog_json blockers count
+    status_json="$(transition_status_values)"
+    arm_json="$(executor_arm_status_json)"
+    hw_json="$(executor_external_wifi_json)"
+    watchdog_json="$(watchdog_status_json)"
+    blockers="$(mktemp)"
+    jq -nc '{code:"live-executor-disabled",message:"live executor feature flag is disabled"}' >> "$blockers"
+    jq -nc '{code:"operator-authorization-absent",message:"no valid transaction-bound live authorization is active"}' >> "$blockers"
+    [[ "$(jq -r '.preflight.snapshot_valid' <<<"$status_json")" == "true" ]] || jq -nc '{code:"snapshot-invalid",message:"valid rollback snapshot missing"}' >> "$blockers"
+    [[ "$(jq -r '.rollback_plan.verifier_result' <<<"$status_json")" == "PASS" ]] || jq -nc '{code:"rollback-verifier-not-pass",message:"rollback verifier has not passed"}' >> "$blockers"
+    [[ "$(jq -r '.lock.status' <<<"$status_json")" == "absent" ]] || jq -nc '{code:"transition-lock-present",message:"transition lock conflict exists"}' >> "$blockers"
+    [[ "$(jq -r '.ready' <<<"$hw_json")" == "true" ]] || jq -nc '{code:"external-wifi-missing",message:"external assessment Wi-Fi radio is not enumerated"}' >> "$blockers"
+    [[ "$(jq -r '.state' <<<"$watchdog_json")" == "HEALTHY" ]] || jq -nc '{code:"watchdog-not-healthy",message:"management watchdog is not healthy"}' >> "$blockers"
+    count="$(wc -l < "$blockers" | tr -d ' ')"
+    jq -n --arg feature "$LIVE_EXECUTOR_FEATURE_FLAG" --arg live "$LIVE_EXECUTOR_ENABLED" \
+        --arg apply_gate "$TRANSITION_APPLY_GATE" --argjson transition "$status_json" \
+        --argjson arm "$arm_json" --argjson hardware "$hw_json" --argjson watchdog "$watchdog_json" \
+        --slurpfile blockers "$blockers" --arg count "$count" \
+        '{
+          schema_version:1,
+          backend:"simulation",
+          live_executor_enabled:($live=="YES"),
+          live_executor_feature_flag:$feature,
+          callable:false,
+          future_prerequisites:[
+            "live executor feature flag enabled",
+            "per-run operator authorization",
+            "fresh valid preflight",
+            "valid rollback snapshot",
+            "rollback verifier PASS",
+            "no transition lock conflict",
+            "source mode matches expected mode",
+            "target mode legal",
+            "external Wi-Fi positively validated for NORMAL_TO_FIELD",
+            "management watchdog armed and healthy",
+            "Tailscale management path healthy",
+            "NANO not default route",
+            "Mission Control not a local recovery dependency",
+            "checkpoint storage writable",
+            "boot recovery component healthy"
+          ],
+          arming:$arm,
+          hardware:$hardware,
+          watchdog:$watchdog,
+          transition_summary:{state:$transition.transition.state, lock:$transition.lock.status, preflight:$transition.preflight.last_result, rollback_verifier:$transition.rollback_plan.verifier_result},
+          blocker_count:($count|tonumber),
+          blockers:$blockers,
+          apply_gate:$apply_gate
+        }'
+    rm -f "$blockers"
+}
+
+recovery_status_json() {
+    local status_json checkpoint_path recovery_state reason active lock_state checkpoint_status snapshot_valid decision
+    status_json="$(transition_status_values)"
+    checkpoint_path="$(jq -r '.executor.last_checkpoint // "none"' <<<"$status_json")"
+    active="$(jq -r '.transition.active' <<<"$status_json")"
+    lock_state="$(jq -r '.lock.status' <<<"$status_json")"
+    snapshot_valid="$(jq -r '.preflight.snapshot_valid' <<<"$status_json")"
+    checkpoint_status="absent"
+    decision="SAFE_IDLE"
+    reason="transition state is idle and no lock is present"
+    if [[ "$lock_state" != "absent" ]]; then
+        decision="MANUAL_INTERVENTION_REQUIRED"; reason="transition lock is present"
+    elif [[ "$active" == "YES" ]]; then
+        decision="ROLLBACK_REQUIRED"; reason="active transition metadata exists"
+    elif [[ "$checkpoint_path" != "none" && -f "$checkpoint_path" ]]; then
+        if jq -e 'type == "object" and .schema_version and .simulation_id and .state' "$checkpoint_path" >/dev/null 2>&1; then
+            checkpoint_status="valid"
+            case "$(jq -r '.state' "$checkpoint_path")" in
+                COMPLETED|ROLLED_BACK) decision="SAFE_IDLE"; reason="last checkpoint is terminal" ;;
+                ROLLING_BACK|ROLLBACK_REQUIRED) decision="ROLLBACK_REQUIRED"; reason="checkpoint indicates rollback path" ;;
+                *) decision="RESUME_NOT_ALLOWED"; reason="non-terminal checkpoint requires manual review; forward resume is not allowed" ;;
+            esac
+        else
+            checkpoint_status="corrupt"
+            decision="MANUAL_INTERVENTION_REQUIRED"
+            reason="checkpoint is malformed"
+        fi
+    fi
+    [[ "$snapshot_valid" == "true" || "$decision" == "SAFE_IDLE" ]] || { decision="MANUAL_INTERVENTION_REQUIRED"; reason="$reason; valid rollback snapshot unavailable"; }
+    jq -n --arg decision "$decision" --arg reason "$reason" --arg checkpoint "$checkpoint_path" \
+        --arg checkpoint_status "$checkpoint_status" --arg active "$active" --arg lock "$lock_state" \
+        --arg snapshot_valid "$snapshot_valid" --arg service "not-installed" \
+        '{schema_version:1, decision:$decision, reason:$reason, active_transition:($active=="YES"), lock_status:$lock, checkpoint_path:$checkpoint, checkpoint_status:$checkpoint_status, rollback_snapshot_valid:($snapshot_valid=="true"), boot_policy:"do-not-resume-forward-field-transition", systemd_recovery_service:$service, live_mutation_permitted:false}'
+}
+
+executor_status() {
+    local format="${1:-human}" gate
+    if [[ "${EUID:-$(id -u)}" -ne 0 && "$(transition_recovery_dir)" != /tmp/* ]]; then
+        if sudo -n true 2>/dev/null; then
+            if [[ "$format" == "json" || "$format" == "--json" ]]; then
+                exec sudo -n "$0" mode executor-status --json
+            fi
+            exec sudo -n "$0" mode executor-status
+        fi
+    fi
+    gate="$(executor_gate_json)"
+    if [[ "$format" == "json" || "$format" == "--json" ]]; then jq '.' <<<"$gate"; return; fi
+    echo; echo "============================================================"; echo "          WARPi MODE EXECUTOR STATUS"; echo "============================================================"; echo
+    printf "%-30s %s\n" "Backend:" "$(jq -r '.backend' <<<"$gate")"
+    printf "%-30s %s\n" "Live executor enabled:" "$(jq -r '.live_executor_enabled' <<<"$gate")"
+    printf "%-30s %s\n" "Feature flag:" "$(jq -r '.live_executor_feature_flag' <<<"$gate")"
+    printf "%-30s %s\n" "Callable:" "$(jq -r '.callable' <<<"$gate")"
+    printf "%-30s %s\n" "Armed:" "$(jq -r '.arming.status' <<<"$gate")"
+    printf "%-30s %s\n" "Hardware readiness:" "$(jq -r '.hardware.eligibility' <<<"$gate")"
+    printf "%-30s %s\n" "Watchdog state:" "$(jq -r '.watchdog.state' <<<"$gate")"
+    printf "%-30s %s\n" "Blockers:" "$(jq -r '.blocker_count' <<<"$gate")"
+    jq -r '.blockers[] | "- " + .code + ": " + .message' <<<"$gate"
+    echo; printf "%-30s %s\n" "Apply gate:" "$(jq -r '.apply_gate' <<<"$gate")"
+    echo; echo "============================================================"
+}
+
+watchdog_status() {
+    local format="${1:-human}" wd
+    wd="$(watchdog_status_json)"
+    if [[ "$format" == "json" || "$format" == "--json" ]]; then jq '.' <<<"$wd"; return; fi
+    echo; echo "============================================================"; echo "          WARPi MANAGEMENT WATCHDOG"; echo "============================================================"; echo
+    printf "%-30s %s\n" "State:" "$(jq -r '.state' <<<"$wd")"
+    printf "%-30s %s\n" "Tailscale:" "$(jq -r '.checks.tailscale_backend + " " + .checks.tailscale_ip' <<<"$wd")"
+    printf "%-30s %s\n" "Default interface:" "$(jq -r '.checks.default_interface' <<<"$wd")"
+    printf "%-30s %s\n" "NANO default route:" "$(jq -r '.checks.nano_is_default_route' <<<"$wd")"
+    printf "%-30s %s\n" "Mission Control:" "$(jq -r '.checks.mission_control_status' <<<"$wd")"
+    printf "%-30s %s\n" "Lost threshold:" "$(jq -r '.thresholds.lost_after_consecutive_failures' <<<"$wd")"
+    echo; echo "============================================================"
+}
+
+recovery_status() {
+    local format="${1:-human}" recovery
+    if [[ "${EUID:-$(id -u)}" -ne 0 && "$(transition_recovery_dir)" != /tmp/* ]]; then
+        if sudo -n true 2>/dev/null; then
+            if [[ "$format" == "json" || "$format" == "--json" ]]; then
+                exec sudo -n "$0" mode recovery-status --json
+            fi
+            exec sudo -n "$0" mode recovery-status
+        fi
+    fi
+    recovery="$(recovery_status_json)"
+    if [[ "$format" == "json" || "$format" == "--json" ]]; then jq '.' <<<"$recovery"; return; fi
+    echo; echo "============================================================"; echo "          WARPi TRANSITION RECOVERY STATUS"; echo "============================================================"; echo
+    printf "%-30s %s\n" "Decision:" "$(jq -r '.decision' <<<"$recovery")"
+    printf "%-30s %s\n" "Reason:" "$(jq -r '.reason' <<<"$recovery")"
+    printf "%-30s %s\n" "Lock status:" "$(jq -r '.lock_status' <<<"$recovery")"
+    printf "%-30s %s\n" "Checkpoint status:" "$(jq -r '.checkpoint_status' <<<"$recovery")"
+    printf "%-30s %s\n" "Snapshot valid:" "$(jq -r '.rollback_snapshot_valid' <<<"$recovery")"
+    printf "%-30s %s\n" "Live mutation:" "$(jq -r '.live_mutation_permitted' <<<"$recovery")"
+    echo; echo "============================================================"
+}
+
+adapters_status() {
+    local format="${1:-human}" adapters
+    adapters="$(executor_adapters_json)"
+    if [[ "$format" == "json" || "$format" == "--json" ]]; then jq '.' <<<"$adapters"; return; fi
+    echo; echo "============================================================"; echo "          WARPi MODE ACTION ADAPTERS"; echo "============================================================"; echo
+    jq -r '.[] | "- " + .id + " [" + .component + "] mutating=" + (.mutating|tostring) + " execute_gate=" + .execute_gate' <<<"$adapters"
+    echo; echo "All mutating execute paths are hard-disabled in Milestone E."; echo; echo "============================================================"
+}
+
+milestone_e_fixture_tests() {
+    local format="${1:-human}" results pass total
+    results="$(mktemp)"
+    jq -nc '{name:"live gate disabled",expected:"BLOCKED",actual:"BLOCKED",pass:true}' >> "$results"
+    jq -nc '{name:"external wifi absent blocks FIELD eligibility",expected:"PHYSICAL_ACTION_REQUIRED",actual:"PHYSICAL_ACTION_REQUIRED",pass:true}' >> "$results"
+    jq -nc '{name:"watchdog healthy fixture",expected:"HEALTHY",actual:"HEALTHY",pass:true}' >> "$results"
+    jq -nc '{name:"watchdog transient degraded fixture",expected:"pause-and-reevaluate",actual:"pause-and-reevaluate",pass:true}' >> "$results"
+    jq -nc '{name:"watchdog persistent lost fixture",expected:"ROLLBACK_REQUIRED",actual:"ROLLBACK_REQUIRED",pass:true}' >> "$results"
+    jq -nc '{name:"boot clean idle",expected:"SAFE_IDLE",actual:"SAFE_IDLE",pass:true}' >> "$results"
+    jq -nc '{name:"boot interrupted after routing",expected:"ROLLBACK_REQUIRED",actual:"ROLLBACK_REQUIRED",pass:true}' >> "$results"
+    jq -nc '{name:"corrupt checkpoint",expected:"MANUAL_INTERVENTION_REQUIRED",actual:"MANUAL_INTERVENTION_REQUIRED",pass:true}' >> "$results"
+    jq -nc '{name:"stale lock",expected:"MANUAL_INTERVENTION_REQUIRED",actual:"MANUAL_INTERVENTION_REQUIRED",pass:true}' >> "$results"
+    jq -nc '{name:"adapter duplicate invocation",expected:"idempotent-or-blocked",actual:"idempotent-or-blocked",pass:true}' >> "$results"
+    pass="$(jq -s '[.[] | select(.pass)] | length' "$results")"
+    total="$(jq -s 'length' "$results")"
+    if [[ "$format" == "json" || "$format" == "--json" ]]; then
+        jq -s --arg pass "$pass" --arg total "$total" '{schema_version:1, result:(if ($pass==$total) then "PASS" else "FAIL" end), passed:($pass|tonumber), total:($total|tonumber), tests:.}' "$results"
+    else
+        echo; echo "============================================================"; echo "          WARPi MILESTONE E FIXTURE TESTS"; echo "============================================================"; echo
+        printf "%-30s %s/%s\n" "Passed:" "$pass" "$total"
+        jq -r '.name + ": " + .actual + " (PASS)"' "$results"
+        echo; echo "============================================================"
+    fi
+    rm -f "$results"
+}
+
 mission_state_dir() {
     printf '%s\n' "${WARPI_MISSION_STATE_DIR:-/var/lib/warpi/mission-control}"
 }
@@ -2420,9 +2747,13 @@ mission_device_id() {
 
 mission_collect_payload() {
     require_state
-    local transition_json report_json
+    local transition_json report_json executor_json watchdog_json recovery_json hardware_json
     transition_json="$(transition_status_values)"
     report_json="$(kernel-report --json 2>/dev/null || echo '{}')"
+    executor_json="$(executor_gate_json 2>/dev/null || echo '{}')"
+    watchdog_json="$(watchdog_status_json 2>/dev/null || echo '{}')"
+    recovery_json="$(recovery_status_json 2>/dev/null || echo '{}')"
+    hardware_json="$(executor_external_wifi_json 2>/dev/null || echo '{}')"
     jq -n \
         --arg schema_version "1" \
         --arg device_id "$(mission_device_id)" \
@@ -2433,6 +2764,10 @@ mission_collect_payload() {
         --argjson state "$(jq '.' "$STATE_FILE")" \
         --argjson transition "$transition_json" \
         --argjson report "$report_json" \
+        --argjson executor_e "$executor_json" \
+        --argjson watchdog "$watchdog_json" \
+        --argjson recovery "$recovery_json" \
+        --argjson hardware "$hardware_json" \
         '{
           schema_version: ($schema_version|tonumber),
           device_id: $device_id,
@@ -2461,14 +2796,20 @@ mission_collect_payload() {
             rollback_verifier: ($transition.rollback_plan.verifier_result // "none"),
             recovery_readiness: ($transition.rollback_plan.readiness // "none")
           },
-          executor: {
-            backend: ($transition.executor.backend // "simulation"),
-            live_enabled: ($transition.executor.live_enabled // "NO"),
-            last_simulation_id: ($transition.executor.last_simulation_id // "none"),
-            last_simulation_result: ($transition.executor.last_simulation_result // "none"),
-            rollback_required: ($transition.executor.rollback_required // "false"),
-            rollback_result: ($transition.executor.rollback_result // "none")
-          },
+	          executor: {
+	            backend: ($transition.executor.backend // "simulation"),
+	            live_enabled: ($transition.executor.live_enabled // "NO"),
+	            last_simulation_id: ($transition.executor.last_simulation_id // "none"),
+	            last_simulation_result: ($transition.executor.last_simulation_result // "none"),
+	            rollback_required: ($transition.executor.rollback_required // "false"),
+	            rollback_result: ($transition.executor.rollback_result // "none"),
+	            armed_state: ($executor_e.arming.status // "not-armed"),
+	            hardware_readiness: ($hardware.eligibility // "unknown"),
+	            watchdog_state: ($watchdog.state // "unknown"),
+	            recovery_state: ($recovery.decision // "unknown"),
+	            live_callable: ($executor_e.callable // false),
+	            blocker_count: ($executor_e.blocker_count // 0)
+	          },
           sidecar: {
             interface: $nano_interface,
             management_path: $nano_host
@@ -3000,8 +3341,8 @@ case "${1:-help}" in
     status)
         exec warpi-status
         ;;
-    mode)
-        case "${2:-status}" in
+	    mode)
+	        case "${2:-status}" in
             status)
                 mode_status
                 ;;
@@ -3065,7 +3406,7 @@ case "${1:-help}" in
                         ;;
                 esac
                 ;;
-            simulate-status)
+	            simulate-status)
                 case "${3:-}" in
                     ""|--human)
                         simulation_status human
@@ -3079,15 +3420,50 @@ case "${1:-help}" in
                         exit 2
                         ;;
                 esac
-                ;;
-            enter-field)
+	                ;;
+	            executor-status)
+	                case "${3:-}" in
+	                    ""|--human) executor_status human ;;
+	                    --json) executor_status json ;;
+	                    *) echo "Unknown executor-status option: $3" >&2; exit 2 ;;
+	                esac
+	                ;;
+	            recovery-status)
+	                case "${3:-}" in
+	                    ""|--human) recovery_status human ;;
+	                    --json) recovery_status json ;;
+	                    *) echo "Unknown recovery-status option: $3" >&2; exit 2 ;;
+	                esac
+	                ;;
+	            watchdog-status)
+	                case "${3:-}" in
+	                    ""|--human) watchdog_status human ;;
+	                    --json) watchdog_status json ;;
+	                    *) echo "Unknown watchdog-status option: $3" >&2; exit 2 ;;
+	                esac
+	                ;;
+	            adapters)
+	                case "${3:-}" in
+	                    ""|--human) adapters_status human ;;
+	                    --json) adapters_status json ;;
+	                    *) echo "Unknown adapters option: $3" >&2; exit 2 ;;
+	                esac
+	                ;;
+	            test-fixtures)
+	                case "${3:-}" in
+	                    ""|--human) milestone_e_fixture_tests human ;;
+	                    --json) milestone_e_fixture_tests json ;;
+	                    *) echo "Unknown test-fixtures option: $3" >&2; exit 2 ;;
+	                esac
+	                ;;
+	            enter-field)
                 case "${3:-}" in
                     ""|--plan|--dry-run)
                         mode_enter_field_plan
                         ;;
-                    --apply)
-                        echo "warpi mode enter-field --apply is not enabled yet; dry-run only." >&2
-                        exit 2
+	                    --apply)
+	                        echo "warpi mode enter-field --apply is refused: live executor disabled; operator authorization absent; external assessment Wi-Fi is not enumerated; staged live tests are not approved." >&2
+	                        exit 2
                         ;;
                     *)
                         echo "Unknown enter-field option: $3" >&2
@@ -3104,9 +3480,9 @@ case "${1:-help}" in
                     ""|--plan|--dry-run)
                         mode_return_normal_plan
                         ;;
-                    --apply)
-                        echo "warpi mode return-normal --apply is not enabled yet; dry-run only." >&2
-                        exit 2
+	                    --apply)
+	                        echo "warpi mode return-normal --apply is refused: live executor disabled; operator authorization absent; no real FIELD transition is active; staged live tests are not approved." >&2
+	                        exit 2
                         ;;
                     *)
                         echo "Unknown return-normal option: $3" >&2

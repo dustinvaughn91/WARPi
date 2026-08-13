@@ -351,7 +351,56 @@ Management-path invariants:
 
 The external Wi-Fi adapter remains a real hardware prerequisite for FIELD readiness. If no extra Wi-Fi interface beyond `wlan0` is enumerated, the simulator reports `REAL HARDWARE PREREQUISITE MISSING` and treats the run as executor-logic validation only.
 
-The next milestone should be Milestone E: staged real action adapters behind a hard manual safety gate, still default-disabled. Milestone E must not authorize end-to-end live Field Mode until external Wi-Fi hardware is present and validated, boot/interruption recovery is implemented, rollback execution is proven in a controlled local test, a management-path watchdog exists, and Dustin explicitly approves a staged live test.
+## Milestone E Disabled Live Adapter Architecture
+
+Milestone E adds the real executor shape without making live execution callable.
+
+New read-only/status commands:
+
+- `warpi mode executor-status`
+- `warpi mode executor-status --json`
+- `warpi mode recovery-status`
+- `warpi mode recovery-status --json`
+- `warpi mode watchdog-status`
+- `warpi mode watchdog-status --json`
+- `warpi mode adapters`
+- `warpi mode adapters --json`
+- `warpi mode test-fixtures`
+- `warpi mode test-fixtures --json`
+
+The adapter inventory defines future bounded action adapters with stable IDs, ordering, component, mutating flag, preconditions, postconditions, rollback adapter, and the conceptual interface `validate`, `preview`, `execute`, `verify`, `rollback`, and `describe`.
+
+Adapter IDs:
+
+- `validate-hardware`
+- `capture-rollback`
+- `prepare-assessment-radio`
+- `prepare-routing`
+- `prepare-firewall`
+- `verify-management-path`
+- `configure-field-services`
+- `verify-field-health`
+- `commit-mode`
+- `restore-network`
+- `restore-routing`
+- `restore-firewall`
+- `restore-services`
+- `restore-mode`
+- `final-health`
+
+Every mutating adapter has `execute_gate=disabled`. There is no documented or hidden CLI/config/environment bypass that can execute live mutation in Milestone E.
+
+The live gate remains non-callable unless all future prerequisites are met: live executor feature flag, transaction-bound operator authorization, fresh valid preflight, valid rollback snapshot, rollback verifier `PASS`, no lock conflict, legal source/target state, positively validated external Wi-Fi for `NORMAL_TO_FIELD`, management watchdog `HEALTHY`, Tailscale healthy, NANO not default route, Mission Control not required for local recovery, writable checkpoint storage, and boot recovery health.
+
+The arming model is represented by `/run/warpi/mode-executor.arm`, but no Milestone E command creates a live arm. A future arm must be root-owned, transaction-bound, expiring, non-reusable, visible without exposing secret material, and cleared by boot. While the live executor feature flag is disabled, any arm state is informational only.
+
+The external assessment-radio prerequisite is first-class. `NORMAL_TO_FIELD` live eligibility is false unless a second wireless device distinct from `wlan0` exists, has a distinct phy, has recordable driver/hardware identity, and is not the management uplink or default route. As of Milestone E, WARPi still does not enumerate an external Wi-Fi USB device, so FIELD readiness remains blocked by physical hardware.
+
+The management watchdog classifies state as `HEALTHY`, `DEGRADED`, or `LOST` using Tailscale backend/IP, route to a management peer, default route/interface, active uplink, NANO default-route safety, and Mission Control as informational only. The default future threshold is three consecutive LOST checks. DEGRADED should pause and re-evaluate; persistent LOST should stop forward execution and mark rollback required.
+
+Boot/interruption recovery reports one of `SAFE_IDLE`, `RESUME_NOT_ALLOWED`, `ROLLBACK_REQUIRED`, or `MANUAL_INTERVENTION_REQUIRED`. The policy is conservative: do not resume forward toward FIELD after interruption, prefer rollback to the last known-good source state, and require manual intervention for corrupt or contradictory metadata.
+
+Mission Control check-in includes bounded Milestone E telemetry: armed state, hardware readiness, watchdog state, recovery decision, live-callable flag, and blocker count. Mission Control remains observational and is not required for local recovery.
 
 ## Future Runtime Mode State Machine
 
@@ -704,17 +753,17 @@ Milestone A: state machine and transaction framework, no live mutations.
 
 Milestone B: state capture and last-known-good rollback metadata.
 
-Milestone C: mocked command executor and failure injection tests.
+Milestone C: rollback verifier and recovery planner.
 
-Milestone D: implement `enter-field --apply` stages behind disabled gate.
+Milestone D: simulation-only staged executor, checkpointing, failure injection, and rollback simulation.
 
-Milestone E: implement `return-normal --apply` stages behind disabled gate.
+Milestone E: disabled live adapter architecture, hard gate, arming framework, external-radio prerequisite, management watchdog, boot/interruption recovery status, and fixture tests.
 
-Milestone F: automated rollback behavior.
+Milestone F: controlled live readiness and hardware validation after the external Wi-Fi adapter positively enumerates.
 
-Milestone G: boot and interrupted-transition recovery.
+Milestone G: staged live adapter validation under explicit approval, still not end-to-end FIELD apply.
 
-Milestone H: live supervised validation.
+Milestone H: supervised live transition rehearsal with local recovery path and management watchdog.
 
 Milestone I: enable production apply gate after successful review.
 
