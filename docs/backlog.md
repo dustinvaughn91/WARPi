@@ -5,14 +5,16 @@
 - Accept Day 1 baseline as starting point.
 - Define backup/checkpoint method before modifying WARPi.
 - Resolve mode-control drift without blindly restoring legacy scripts.
-- Validate Mission Control reachability from WARPi, OpenClaw, and `mission01`.
+- Keep Mission Control health/check-in regression tests in the regular WARPi validation path.
 - Update documentation after live truths are confirmed.
 
 ## P1
 
 - Define the K.E.R.N.E.L./WARPi command contract.
 - Keep `warpi mode enter-field` and `warpi mode return-normal` in dry-run planner mode until the apply workflow and recovery path are explicitly approved.
-- Restore approved shell/API access to protected `mission01` so Mission Control containers, persistence, authentication, and server-side heartbeat ingestion can be inspected and repaired.
+- Put Mission Control server source/configuration under a canonical Git repository; `/srv/mission-control` is currently a live deployment path, not a Git working tree.
+- Verify Mission Control VM startup/onboot and backup coverage from the PVE side; routine protected-VM audit access remains restricted.
+- Define an application-aware PostgreSQL backup/restore procedure for Mission Control device/mission state.
 - Build staged real action adapters behind an explicit hard manual safety gate, still default-disabled, before any real mode apply path is approved.
 - Implement the reversible mode-transition design in staged milestones; Milestone A transition-status, Milestone B preflight rollback-snapshot capture, Milestone C rollback planning, and Milestone D executor simulation are complete, while live apply remains gated.
 - Validate field readiness: cold boot, trusted network, offline behavior, Tailscale reconnect, display status, logs/storage.

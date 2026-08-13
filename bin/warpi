@@ -2360,6 +2360,8 @@ mission_auth_configured() {
     token_file="$(mission_token_file)"
     if [[ -n "${MISSION_BEARER_TOKEN:-}" || -r "$token_file" ]]; then
         echo "YES"
+    elif sudo -n test -s "$token_file" 2>/dev/null; then
+        echo "YES"
     else
         echo "NO"
     fi
@@ -2544,6 +2546,14 @@ mission_probe_health_json() {
 
 mission_status() {
     local output_format="${1:-human}" status_json last_file
+    if [[ "${EUID:-$(id -u)}" -ne 0 && "$(mission_state_dir)" != /tmp/* ]]; then
+        if sudo -n true 2>/dev/null; then
+            if [[ "$output_format" == "json" || "$output_format" == "--json" ]]; then
+                exec sudo -n "$0" mission status --json
+            fi
+            exec sudo -n "$0" mission status
+        fi
+    fi
     status_json="$(mission_probe_health_json)"
     last_file="$(mission_last_checkin_file)"
     if [[ "$output_format" == "json" || "$output_format" == "--json" ]]; then
@@ -2657,7 +2667,7 @@ mission_check_in() {
     printf "%-30s %s\n" "Result:" "$result"
     printf "%-30s %s\n" "Endpoint:" "$endpoint"
     printf "%-30s %s\n" "Device ID:" "$(jq -r '.payload_summary.device_id' "$last_file")"
-    printf "%-30s %s\n" "Mode/state:" "$(jq -r '.payload_summary.mode + \"/\" + .payload_summary.state' "$last_file")"
+    printf "%-30s %s\n" "Mode/state:" "$(jq -r '.payload_summary.mode + "/" + .payload_summary.state' "$last_file")"
     printf "%-30s %s\n" "Transition state:" "$(jq -r '.payload_summary.transition_state' "$last_file")"
     printf "%-30s %s\n" "Executor backend:" "$(jq -r '.payload_summary.executor_backend' "$last_file")"
     printf "%-30s %s\n" "Live executor enabled:" "$(jq -r '.payload_summary.live_executor_enabled' "$last_file")"
