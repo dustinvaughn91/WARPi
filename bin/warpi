@@ -80,6 +80,8 @@ Usage:
   warpi mode simulate enter-field
   warpi mode simulate return-normal
   warpi mode simulate-status
+  warpi mission status
+  warpi mission check-in
   warpi mode enter-field
   warpi mode return-normal
   warpi wireless status
@@ -106,6 +108,8 @@ Commands:
                     Simulate staged FIELD -> NORMAL execution, checkpointing, and rollback.
   mode simulate-status
                     Show latest simulation executor checkpoint/status.
+  mission status   Show Mission Control endpoint/auth/check-in status.
+  mission check-in Send a bounded Mission Control heartbeat payload when reachable.
   mode enter-field  Show the Field Mode transition plan without changing state.
   mode return-normal Show the Normal Mode transition plan without changing state.
   wireless status   Show read-only WiFi Pineapple NANO sidecar reachability.
@@ -120,6 +124,10 @@ Mode switching:
   preflight commands create rollback-snapshot metadata but do not change network state or mode.
   rollback-plan is preview-only and supports --transaction ID and --json.
   simulate commands are simulation-only. No live executor backend exists or can be enabled.
+
+Mission Control:
+  mission status and check-in are bounded best-effort operations. Mission Control
+  failure does not block local WARPi operation.
 
 Wireless:
   wireless status is read-only. It does not start scans, change radios, or modify NANO state.
@@ -2335,6 +2343,332 @@ simulation_status() {
     fi
 }
 
+mission_state_dir() {
+    printf '%s\n' "${WARPI_MISSION_STATE_DIR:-/var/lib/warpi/mission-control}"
+}
+
+mission_last_checkin_file() {
+    printf '%s\n' "${WARPI_MISSION_LAST_CHECKIN_FILE:-$(mission_state_dir)/last-checkin.json}"
+}
+
+mission_token_file() {
+    config_value MISSION_TOKEN_FILE "${WARPI_MISSION_TOKEN_FILE:-/etc/warpi/mission-control.token}"
+}
+
+mission_auth_configured() {
+    local token_file
+    token_file="$(mission_token_file)"
+    if [[ -n "${MISSION_BEARER_TOKEN:-}" || -r "$token_file" ]]; then
+        echo "YES"
+    else
+        echo "NO"
+    fi
+}
+
+mission_auth_args() {
+    local token_file token
+    token_file="$(mission_token_file)"
+    if [[ -n "${MISSION_BEARER_TOKEN:-}" ]]; then
+        printf '%s\n' "-H"
+        printf '%s\n' "Authorization: Bearer ${MISSION_BEARER_TOKEN}"
+    elif [[ -r "$token_file" ]]; then
+        token="$(head -n 1 "$token_file" 2>/dev/null || true)"
+        if [[ -n "$token" ]]; then
+            printf '%s\n' "-H"
+            printf '%s\n' "Authorization: Bearer ${token}"
+        fi
+    fi
+}
+
+mission_health_endpoints() {
+    config_value MISSION_ENDPOINTS "http://mission01:8000/health http://mission01.local:8000/health http://100.71.99.18:8000/health"
+}
+
+mission_checkin_endpoints() {
+    local configured endpoint
+    configured="$(config_value MISSION_CHECKIN_ENDPOINTS "")"
+    if [[ -n "$configured" ]]; then
+        printf '%s\n' "$configured"
+        return
+    fi
+    for endpoint in $(mission_health_endpoints); do
+        case "$endpoint" in
+            */health)
+                printf '%s ' "${endpoint%/health}/api/warpi/check-in"
+                ;;
+            *)
+                printf '%s ' "$endpoint/api/warpi/check-in"
+                ;;
+        esac
+    done
+    echo
+}
+
+mission_device_id() {
+    local configured machine_id host
+    configured="$(config_value MISSION_DEVICE_ID "")"
+    if [[ -n "$configured" ]]; then
+        printf '%s\n' "$configured"
+        return
+    fi
+    machine_id="$(cat /etc/machine-id 2>/dev/null || echo unknown)"
+    host="$(hostname 2>/dev/null || echo warpi)"
+    printf 'warpi-%s-%s\n' "$host" "$(printf '%s' "$machine_id" | sha256sum | cut -c1-12)"
+}
+
+mission_collect_payload() {
+    require_state
+    local transition_json report_json
+    transition_json="$(transition_status_values)"
+    report_json="$(kernel-report --json 2>/dev/null || echo '{}')"
+    jq -n \
+        --arg schema_version "1" \
+        --arg device_id "$(mission_device_id)" \
+        --arg hostname "$(hostname 2>/dev/null || echo unknown)" \
+        --arg timestamp "$(utc_now)" \
+        --arg nano_interface "$NANO_INTERFACE" \
+        --arg nano_host "$NANO_HOST" \
+        --argjson state "$(jq '.' "$STATE_FILE")" \
+        --argjson transition "$transition_json" \
+        --argjson report "$report_json" \
+        '{
+          schema_version: ($schema_version|tonumber),
+          device_id: $device_id,
+          timestamp: $timestamp,
+          hostname: $hostname,
+          mode: ($state.mode // "unknown"),
+          state: ($state.state // "unknown"),
+          online: true,
+          tailscale: {
+            connected: ($state.network.tailscale // false),
+            ip: ($state.network.tailscale_ip // "unknown")
+          },
+          network: {
+            active_profile: ($state.network.wifi_profile // "unknown"),
+            interface: ($state.network.interface // "unknown"),
+            ipv4: ($state.network.ipv4 // "unknown")
+          },
+          mission_observed_state: ($state.mission // {}),
+          transition: {
+            state: ($transition.transition.state // "unknown"),
+            active: ($transition.transition.active // "unknown"),
+            transaction_id: ($transition.transition.transition_id // "none"),
+            last_preflight_id: ($transition.preflight.last_transaction_id // "none"),
+            last_preflight_result: ($transition.preflight.last_result // "none"),
+            rollback_snapshot_valid: ($transition.preflight.snapshot_valid // "unknown"),
+            rollback_verifier: ($transition.rollback_plan.verifier_result // "none"),
+            recovery_readiness: ($transition.rollback_plan.readiness // "none")
+          },
+          executor: {
+            backend: ($transition.executor.backend // "simulation"),
+            live_enabled: ($transition.executor.live_enabled // "NO"),
+            last_simulation_id: ($transition.executor.last_simulation_id // "none"),
+            last_simulation_result: ($transition.executor.last_simulation_result // "none"),
+            rollback_required: ($transition.executor.rollback_required // "false"),
+            rollback_result: ($transition.executor.rollback_result // "none")
+          },
+          sidecar: {
+            interface: $nano_interface,
+            management_path: $nano_host
+          },
+          gps: ($state.gps // {}),
+          services: ($report.services // {})
+        }'
+}
+
+mission_probe_health_json() {
+    local endpoints timeout max_time endpoint status payload error reachable healthy postgres redis
+    endpoints="$(mission_health_endpoints)"
+    timeout="$(config_value MISSION_CONNECT_TIMEOUT "3")"
+    max_time="$(config_value MISSION_MAX_TIME "5")"
+    reachable="false"
+    healthy="false"
+    status="offline"
+    endpoint="none"
+    error="no-endpoints-configured"
+    postgres="unknown"
+    redis="unknown"
+
+    for endpoint in $endpoints; do
+        payload="$(curl -fsS --connect-timeout "$timeout" --max-time "$max_time" -H "Accept: application/json" "$endpoint" 2>/tmp/warpi-mission-curl.err || true)"
+        if [[ -z "$payload" ]]; then
+            error="$(cat /tmp/warpi-mission-curl.err 2>/dev/null || echo connection-failed)"
+            continue
+        fi
+        if ! jq -e 'type == "object"' <<<"$payload" >/dev/null 2>&1; then
+            error="invalid-json"
+            continue
+        fi
+        reachable="true"
+        endpoint="$endpoint"
+        status="$(jq -r '.status // "unknown"' <<<"$payload")"
+        postgres="$(jq -r 'if .postgres == true then "healthy" elif .postgres == false then "unhealthy" else "unknown" end' <<<"$payload")"
+        redis="$(jq -r 'if .redis == true then "healthy" elif .redis == false then "unhealthy" else "unknown" end' <<<"$payload")"
+        if [[ "${status,,}" == "healthy" && "$postgres" == "healthy" && "$redis" == "healthy" ]]; then
+            healthy="true"
+        fi
+        error=""
+        break
+    done
+    rm -f /tmp/warpi-mission-curl.err
+
+    jq -n \
+        --arg enabled "$(config_value MISSION_ENABLED "true")" \
+        --arg endpoints "$endpoints" \
+        --arg endpoint "$endpoint" \
+        --arg reachable "$reachable" \
+        --arg healthy "$healthy" \
+        --arg status "$status" \
+        --arg postgres "$postgres" \
+        --arg redis "$redis" \
+        --arg error "$error" \
+        --arg auth "$(mission_auth_configured)" \
+        --arg device_id "$(mission_device_id)" \
+        --arg last_file "$(mission_last_checkin_file)" \
+        '{
+          schema_version: 1,
+          enabled: ($enabled == "true" or $enabled == "TRUE" or $enabled == "yes" or $enabled == "YES"),
+          configured_endpoints: ($endpoints | split(" ") | map(select(length > 0))),
+          selected_endpoint: $endpoint,
+          reachable: ($reachable == "true"),
+          healthy: ($healthy == "true"),
+          status: $status,
+          postgres: $postgres,
+          redis: $redis,
+          error: $error,
+          authentication_configured: ($auth == "YES"),
+          device_id: $device_id,
+          last_checkin_file: $last_file
+        }'
+}
+
+mission_status() {
+    local output_format="${1:-human}" status_json last_file
+    status_json="$(mission_probe_health_json)"
+    last_file="$(mission_last_checkin_file)"
+    if [[ "$output_format" == "json" || "$output_format" == "--json" ]]; then
+        jq --argjson last "$(if require_json_object_file "$last_file"; then jq '.' "$last_file"; else echo '{}'; fi)" '.last_checkin = $last' <<<"$status_json"
+        return
+    fi
+    echo
+    echo "============================================================"
+    echo "              WARPi MISSION CONTROL"
+    echo "============================================================"
+    echo
+    printf "%-30s %s\n" "Enabled:" "$(jq -r '.enabled' <<<"$status_json")"
+    printf "%-30s %s\n" "Configured endpoints:" "$(jq -r '.configured_endpoints | join(", ")' <<<"$status_json")"
+    printf "%-30s %s\n" "Selected endpoint:" "$(jq -r '.selected_endpoint' <<<"$status_json")"
+    printf "%-30s %s\n" "Reachable:" "$(jq -r '.reachable' <<<"$status_json")"
+    printf "%-30s %s\n" "Healthy:" "$(jq -r '.healthy' <<<"$status_json")"
+    printf "%-30s %s\n" "Status:" "$(jq -r '.status' <<<"$status_json")"
+    printf "%-30s %s\n" "PostgreSQL:" "$(jq -r '.postgres' <<<"$status_json")"
+    printf "%-30s %s\n" "Redis:" "$(jq -r '.redis' <<<"$status_json")"
+    printf "%-30s %s\n" "Auth configured:" "$(jq -r '.authentication_configured' <<<"$status_json")"
+    printf "%-30s %s\n" "Device ID:" "$(jq -r '.device_id' <<<"$status_json")"
+    if require_json_object_file "$last_file"; then
+        printf "%-30s %s\n" "Last check-in:" "$(jq -r '.completed_at // "none"' "$last_file")"
+        printf "%-30s %s\n" "Last check-in result:" "$(jq -r '.result // "none"' "$last_file")"
+    else
+        printf "%-30s %s\n" "Last check-in:" "none"
+        printf "%-30s %s\n" "Last check-in result:" "none"
+    fi
+    printf "%-30s %s\n" "Error:" "$(jq -r '.error' <<<"$status_json")"
+    echo
+    echo "Mission Control failure does not block local WARPi operation."
+    echo
+    echo "============================================================"
+}
+
+mission_check_in() {
+    local output_format="${1:-human}" endpoints timeout max_time payload endpoint response result error completed_at state_dir last_file auth_args=()
+    require_state
+    if [[ "${EUID:-$(id -u)}" -ne 0 && "$(mission_state_dir)" != /tmp/* ]]; then
+        if sudo -n true 2>/dev/null; then
+            if [[ "$output_format" == "json" || "$output_format" == "--json" ]]; then
+                exec sudo -n "$0" mission check-in --json
+            fi
+            exec sudo -n "$0" mission check-in
+        fi
+        echo "warpi mission check-in requires root or passwordless sudo for protected check-in metadata writes." >&2
+        exit 1
+    fi
+    endpoints="$(mission_checkin_endpoints)"
+    timeout="$(config_value MISSION_CONNECT_TIMEOUT "3")"
+    max_time="$(config_value MISSION_MAX_TIME "5")"
+    payload="$(mission_collect_payload)"
+    result="failed"
+    endpoint="none"
+    response=""
+    error="no-checkin-endpoints-configured"
+    completed_at="$(utc_now)"
+    state_dir="$(mission_state_dir)"
+    last_file="$(mission_last_checkin_file)"
+    mapfile -t auth_args < <(mission_auth_args)
+
+    for endpoint in $endpoints; do
+        response="$(curl -fsS --connect-timeout "$timeout" --max-time "$max_time" \
+            -H "Content-Type: application/json" -H "Accept: application/json" \
+            "${auth_args[@]}" \
+            --data-binary "$payload" "$endpoint" 2>/tmp/warpi-mission-checkin.err || true)"
+        if [[ -n "$response" ]]; then
+            result="success"
+            error=""
+            break
+        fi
+        error="$(cat /tmp/warpi-mission-checkin.err 2>/dev/null || echo connection-failed)"
+    done
+    rm -f /tmp/warpi-mission-checkin.err
+    mkdir -p "$state_dir"
+    chmod 750 "$state_dir" 2>/dev/null || true
+    jq -n \
+        --arg schema_version "1" \
+        --arg completed_at "$completed_at" \
+        --arg endpoint "$endpoint" \
+        --arg result "$result" \
+        --arg error "$error" \
+        --arg auth "$(mission_auth_configured)" \
+        --argjson payload "$payload" \
+        '{
+          schema_version: ($schema_version|tonumber),
+          completed_at: $completed_at,
+          endpoint: $endpoint,
+          result: $result,
+          error: $error,
+          authentication_configured: ($auth == "YES"),
+          payload_summary: {
+            device_id: $payload.device_id,
+            mode: $payload.mode,
+            state: $payload.state,
+            transition_state: $payload.transition.state,
+            executor_backend: $payload.executor.backend,
+            live_executor_enabled: $payload.executor.live_enabled
+          }
+        }' | atomic_write_json "$last_file" 640 root "$(transition_read_group)"
+
+    if [[ "$output_format" == "json" || "$output_format" == "--json" ]]; then
+        jq '.' "$last_file"
+        return
+    fi
+    echo
+    echo "============================================================"
+    echo "           WARPi MISSION CONTROL CHECK-IN"
+    echo "============================================================"
+    echo
+    printf "%-30s %s\n" "Result:" "$result"
+    printf "%-30s %s\n" "Endpoint:" "$endpoint"
+    printf "%-30s %s\n" "Device ID:" "$(jq -r '.payload_summary.device_id' "$last_file")"
+    printf "%-30s %s\n" "Mode/state:" "$(jq -r '.payload_summary.mode + \"/\" + .payload_summary.state' "$last_file")"
+    printf "%-30s %s\n" "Transition state:" "$(jq -r '.payload_summary.transition_state' "$last_file")"
+    printf "%-30s %s\n" "Executor backend:" "$(jq -r '.payload_summary.executor_backend' "$last_file")"
+    printf "%-30s %s\n" "Live executor enabled:" "$(jq -r '.payload_summary.live_executor_enabled' "$last_file")"
+    printf "%-30s %s\n" "Error:" "$error"
+    echo
+    echo "Mission Control check-in failure does not block local WARPi operation."
+    echo
+    echo "============================================================"
+    [[ "$result" == "success" ]]
+}
+
 mode_status() {
     require_state
 
@@ -2774,6 +3108,48 @@ case "${1:-help}" in
             *)
                 echo "Unknown mode command: ${2:-}" >&2
                 echo "Try: warpi mode status" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    mission)
+        case "${2:-status}" in
+            status)
+                case "${3:-}" in
+                    ""|--human)
+                        mission_status human
+                        ;;
+                    --json)
+                        mission_status json
+                        ;;
+                    *)
+                        echo "Unknown mission status option: $3" >&2
+                        echo "Try: warpi mission status" >&2
+                        exit 2
+                        ;;
+                esac
+                ;;
+            check-in)
+                case "${3:-}" in
+                    ""|--human)
+                        mission_check_in human
+                        ;;
+                    --json)
+                        mission_check_in json
+                        ;;
+                    *)
+                        echo "Unknown mission check-in option: $3" >&2
+                        echo "Try: warpi mission check-in" >&2
+                        exit 2
+                        ;;
+                esac
+                ;;
+            help|-h|--help)
+                usage
+                ;;
+            *)
+                echo "Unknown mission command: ${2:-}" >&2
+                echo "Try: warpi mission status" >&2
                 exit 2
                 ;;
         esac
