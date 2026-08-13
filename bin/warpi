@@ -16,7 +16,11 @@ TRANSITION_RECOVERY_DIR="${TRANSITION_RECOVERY_DIR:-/var/lib/warpi/mode-transiti
 TRANSITION_ROLLBACK_FILE="${TRANSITION_ROLLBACK_FILE:-/var/lib/warpi/mode-transitions/rollback-plan.json}"
 TRANSITION_PENDING_FILE="${TRANSITION_PENDING_FILE:-/var/lib/warpi/mode-transitions/pending-transition.json}"
 TRANSITION_LAST_PREFLIGHT_FILE="${TRANSITION_LAST_PREFLIGHT_FILE:-/var/lib/warpi/mode-transitions/last-preflight.json}"
+TRANSITION_SIMULATION_LOCK_FILE="${TRANSITION_SIMULATION_LOCK_FILE:-/run/warpi/mode-simulation.lock}"
+TRANSITION_LAST_SIMULATION_FILE="${TRANSITION_LAST_SIMULATION_FILE:-/var/lib/warpi/mode-transitions/last-simulation.json}"
 TRANSITION_APPLY_GATE="apply mode is disabled until transaction execution, rollback, boot recovery, and staged live tests are approved"
+EXECUTOR_BACKEND="simulation"
+LIVE_EXECUTOR_ENABLED="NO"
 
 config_value() {
     local key="$1"
@@ -73,6 +77,9 @@ Usage:
   warpi mode preflight enter-field
   warpi mode preflight return-normal
   warpi mode rollback-plan
+  warpi mode simulate enter-field
+  warpi mode simulate return-normal
+  warpi mode simulate-status
   warpi mode enter-field
   warpi mode return-normal
   warpi wireless status
@@ -93,6 +100,12 @@ Commands:
                     Capture a non-mutating rollback snapshot for a future Normal return.
   mode rollback-plan
                     Verify a rollback snapshot and preview recovery actions without executing them.
+  mode simulate enter-field
+                    Simulate staged NORMAL -> FIELD execution, checkpointing, and rollback.
+  mode simulate return-normal
+                    Simulate staged FIELD -> NORMAL execution, checkpointing, and rollback.
+  mode simulate-status
+                    Show latest simulation executor checkpoint/status.
   mode enter-field  Show the Field Mode transition plan without changing state.
   mode return-normal Show the Normal Mode transition plan without changing state.
   wireless status   Show read-only WiFi Pineapple NANO sidecar reachability.
@@ -106,6 +119,7 @@ Mode switching:
   transition-status is read-only and supports --json for machine-readable output.
   preflight commands create rollback-snapshot metadata but do not change network state or mode.
   rollback-plan is preview-only and supports --transaction ID and --json.
+  simulate commands are simulation-only. No live executor backend exists or can be enabled.
 
 Wireless:
   wireless status is read-only. It does not start scans, change radios, or modify NANO state.
@@ -142,6 +156,14 @@ transition_pending_file() {
 
 transition_last_preflight_file() {
     printf '%s\n' "${WARPI_TRANSITION_LAST_PREFLIGHT_FILE:-$TRANSITION_LAST_PREFLIGHT_FILE}"
+}
+
+transition_simulation_lock_file() {
+    printf '%s\n' "${WARPI_TRANSITION_SIMULATION_LOCK_FILE:-$TRANSITION_SIMULATION_LOCK_FILE}"
+}
+
+transition_last_simulation_file() {
+    printf '%s\n' "${WARPI_TRANSITION_LAST_SIMULATION_FILE:-$TRANSITION_LAST_SIMULATION_FILE}"
 }
 
 transition_state_allowed() {
@@ -211,6 +233,9 @@ transition_status_values() {
     local last_preflight_warning_count last_preflight_completed_at last_preflight_stale
     local rollback_plan_path rollback_plan_status rollback_plan_result rollback_plan_action_count
     local rollback_plan_blockers rollback_plan_warnings rollback_plan_readiness rollback_plan_generated_at
+    local last_simulation_file simulation_status simulation_id simulation_direction simulation_result
+    local simulation_checkpoint simulation_rollback_required simulation_rollback_result simulation_backend
+    local simulation_warnings simulation_blockers simulation_completed_at simulation_live_enabled
 
     lock_file="$(transition_lock_file)"
     state_file="$(transition_state_file)"
@@ -218,6 +243,7 @@ transition_status_values() {
     rollback_file="$(transition_rollback_file)"
     pending_file="$(transition_pending_file)"
     last_preflight_file="$(transition_last_preflight_file)"
+    last_simulation_file="$(transition_last_simulation_file)"
     mode="$(json_value '.mode')"
 
     lock_status="$(transition_file_status "$lock_file")"
@@ -263,6 +289,18 @@ transition_status_values() {
     rollback_plan_warnings="0"
     rollback_plan_readiness="none"
     rollback_plan_generated_at="none"
+    simulation_status="$(transition_file_status "$last_simulation_file")"
+    simulation_id="none"
+    simulation_direction="none"
+    simulation_result="none"
+    simulation_checkpoint="none"
+    simulation_rollback_required="false"
+    simulation_rollback_result="none"
+    simulation_backend="$EXECUTOR_BACKEND"
+    simulation_warnings="0"
+    simulation_blockers="0"
+    simulation_completed_at="none"
+    simulation_live_enabled="$LIVE_EXECUTOR_ENABLED"
 
     if [[ "$lock_status" == "unsafe-symlink" ]]; then
         unsafe_reasons="${unsafe_reasons}lock path is a symlink; "
@@ -273,6 +311,26 @@ transition_status_values() {
 
     if [[ "$state_file_status" == "unsafe-symlink" || "$current_file_status" == "unsafe-symlink" ]]; then
         unsafe_reasons="${unsafe_reasons}transition metadata path is a symlink; "
+    fi
+    if [[ "$simulation_status" == "unsafe-symlink" ]]; then
+        unsafe_reasons="${unsafe_reasons}last simulation path is a symlink; "
+        validation_status="unsafe"
+    elif [[ "$simulation_status" == "present" ]]; then
+        if jq -e . "$last_simulation_file" >/dev/null 2>&1; then
+            simulation_id="$(transition_json_value "$last_simulation_file" '.simulation_id' 'none')"
+            simulation_direction="$(transition_json_value "$last_simulation_file" '.direction' 'none')"
+            simulation_result="$(transition_json_value "$last_simulation_file" '.result' 'none')"
+            simulation_checkpoint="$(transition_json_value "$last_simulation_file" '.last_checkpoint' 'none')"
+            simulation_rollback_required="$(transition_json_value "$last_simulation_file" '.rollback_required' 'false')"
+            simulation_rollback_result="$(transition_json_value "$last_simulation_file" '.rollback_result' 'none')"
+            simulation_backend="$(transition_json_value "$last_simulation_file" '.backend' "$EXECUTOR_BACKEND")"
+            simulation_warnings="$(transition_json_value "$last_simulation_file" '.warning_count' '0')"
+            simulation_blockers="$(transition_json_value "$last_simulation_file" '.blocker_count' '0')"
+            simulation_completed_at="$(transition_json_value "$last_simulation_file" '.completed_at' 'none')"
+        else
+            unsafe_reasons="${unsafe_reasons}last simulation JSON is malformed; "
+            validation_status="unsafe"
+        fi
     fi
     if [[ "$last_preflight_status" == "unsafe-symlink" ]]; then
         unsafe_reasons="${unsafe_reasons}last preflight path is a symlink; "
@@ -449,6 +507,19 @@ transition_status_values() {
         --arg rollback_plan_warnings "$rollback_plan_warnings" \
         --arg rollback_plan_readiness "$rollback_plan_readiness" \
         --arg rollback_plan_generated_at "$rollback_plan_generated_at" \
+        --arg simulation_status "$simulation_status" \
+        --arg simulation_file "$last_simulation_file" \
+        --arg simulation_id "$simulation_id" \
+        --arg simulation_direction "$simulation_direction" \
+        --arg simulation_result "$simulation_result" \
+        --arg simulation_checkpoint "$simulation_checkpoint" \
+        --arg simulation_rollback_required "$simulation_rollback_required" \
+        --arg simulation_rollback_result "$simulation_rollback_result" \
+        --arg simulation_backend "$simulation_backend" \
+        --arg simulation_warnings "$simulation_warnings" \
+        --arg simulation_blockers "$simulation_blockers" \
+        --arg simulation_completed_at "$simulation_completed_at" \
+        --arg simulation_live_enabled "$simulation_live_enabled" \
         --arg rollback_available "$rollback_available" \
         --arg validation_status "$validation_status" \
         --arg blockers "$blockers" \
@@ -512,6 +583,21 @@ transition_status_values() {
             warning_count: $rollback_plan_warnings,
             readiness: $rollback_plan_readiness,
             generated_at: $rollback_plan_generated_at
+          },
+          executor: {
+            backend: $simulation_backend,
+            live_enabled: $simulation_live_enabled,
+            last_simulation_status: $simulation_status,
+            last_simulation_path: $simulation_file,
+            last_simulation_id: $simulation_id,
+            last_simulation_direction: $simulation_direction,
+            last_simulation_result: $simulation_result,
+            last_checkpoint: $simulation_checkpoint,
+            rollback_required: $simulation_rollback_required,
+            rollback_result: $simulation_rollback_result,
+            warning_count: $simulation_warnings,
+            blocker_count: $simulation_blockers,
+            completed_at: $simulation_completed_at
           },
           validation: {
             status: $validation_status,
@@ -577,6 +663,18 @@ transition_status() {
     printf "%-32s %s\n" "Recovery warnings:" "$(jq -r '.rollback_plan.warning_count' <<<"$status_json")"
     printf "%-32s %s\n" "Recovery readiness:" "$(jq -r '.rollback_plan.readiness' <<<"$status_json")"
     printf "%-32s %s\n" "Plan generated:" "$(jq -r '.rollback_plan.generated_at' <<<"$status_json")"
+    echo
+    printf "%-32s %s\n" "Executor backend:" "$(jq -r '.executor.backend' <<<"$status_json")"
+    printf "%-32s %s\n" "Live executor enabled:" "$(jq -r '.executor.live_enabled' <<<"$status_json")"
+    printf "%-32s %s\n" "Last simulation:" "$(jq -r '.executor.last_simulation_status' <<<"$status_json")"
+    printf "%-32s %s\n" "Last simulation ID:" "$(jq -r '.executor.last_simulation_id' <<<"$status_json")"
+    printf "%-32s %s\n" "Last simulation direction:" "$(jq -r '.executor.last_simulation_direction' <<<"$status_json")"
+    printf "%-32s %s\n" "Last simulation result:" "$(jq -r '.executor.last_simulation_result' <<<"$status_json")"
+    printf "%-32s %s\n" "Last checkpoint:" "$(jq -r '.executor.last_checkpoint' <<<"$status_json")"
+    printf "%-32s %s\n" "Rollback required:" "$(jq -r '.executor.rollback_required' <<<"$status_json")"
+    printf "%-32s %s\n" "Rollback result:" "$(jq -r '.executor.rollback_result' <<<"$status_json")"
+    printf "%-32s %s\n" "Simulation blockers:" "$(jq -r '.executor.blocker_count' <<<"$status_json")"
+    printf "%-32s %s\n" "Simulation warnings:" "$(jq -r '.executor.warning_count' <<<"$status_json")"
     echo
     printf "%-32s %s\n" "Validation status:" "$(jq -r '.validation.status' <<<"$status_json")"
     printf "%-32s %s\n" "Future apply eligible:" "$(jq -r '.validation.future_apply_eligible' <<<"$status_json")"
@@ -1059,7 +1157,7 @@ preflight_validate_snapshot() {
         preflight_add_finding "$findings_file" "BLOCK" "snapshot-incomplete" "Rollback snapshot is missing required fields."
     fi
 
-    if jq -e '.. | strings | test("(?i)(BEGIN .*PRIVATE|PRIVATE KEY|Authorization:|Bearer |password=|psk=|token=|secret=)")' "$snapshot_path" >/dev/null; then
+    if jq -e 'any(.. | strings; test("(?i)(BEGIN .*PRIVATE|PRIVATE KEY|Authorization:|Bearer |password=|psk=|token=|secret=)"))' "$snapshot_path" >/dev/null; then
         preflight_add_finding "$findings_file" "BLOCK" "snapshot-secret-pattern" "Rollback snapshot contains a credential-like pattern."
     fi
 }
@@ -1377,7 +1475,11 @@ safe_file_metadata() {
     local mode owner
     owner="$(stat -c '%U' "$path" 2>/dev/null || echo unknown)"
     mode="$(stat -c '%a' "$path" 2>/dev/null || echo 777)"
-    [[ "$owner" == "root" ]] || return 1
+    if [[ "$(transition_recovery_dir)" == /tmp/* ]]; then
+        [[ "$owner" == "$(id -un)" || "$owner" == "root" ]] || return 1
+    else
+        [[ "$owner" == "root" ]] || return 1
+    fi
     [[ ${#mode} -ge 3 ]] || return 1
     local group_digit="${mode: -2:1}"
     local other_digit="${mode: -1}"
@@ -1442,7 +1544,7 @@ rollback_verify_snapshot() {
         jq -e "$expr != null and $expr != \"\"" "$snapshot_path" >/dev/null || plan_add_finding "$findings_file" "BLOCK" "missing-required-field" "Snapshot missing required field: $expr."
     done
 
-    if jq -e '.. | strings | test("(?i)(BEGIN .*PRIVATE|PRIVATE KEY|Authorization:|Bearer |password=|psk=|token=|secret=)")' "$snapshot_path" >/dev/null; then
+    if jq -e 'any(.. | strings; test("(?i)(BEGIN .*PRIVATE|PRIVATE KEY|Authorization:|Bearer |password=|psk=|token=|secret=)"))' "$snapshot_path" >/dev/null; then
         plan_add_finding "$findings_file" "BLOCK" "snapshot-secret-pattern" "Snapshot contains a credential-like pattern."
     fi
 
@@ -1711,6 +1813,526 @@ rollback_plan_report() {
     jq -r '.recovery_plan.actions[] | (.sequence|tostring) + ". " + .phase + " / " + .component + "\n   Current: " + .current_state + "\n   Desired: " + .desired_state + "\n   Action: " + .proposed_action + "\n   Risk: " + .risk_level + " | Connectivity: " + .connectivity_impact + "\n   Preview: " + .command_preview' "$plan_path"
     echo
     echo "============================================================"
+}
+
+generate_simulation_id() {
+    printf 'sim-%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+simulation_id_allowed() {
+    [[ "$1" =~ ^sim-[0-9TZ]+-[0-9a-f]{12}$ ]]
+}
+
+simulation_paths() {
+    local simulation_id="$1"
+    printf '%s/%s\n' "$(transition_recovery_dir)" "$simulation_id"
+}
+
+simulation_checkpoint_path() {
+    local simulation_id="$1"
+    printf '%s/executor-checkpoint.json\n' "$(simulation_paths "$simulation_id")"
+}
+
+simulation_history_path() {
+    local simulation_id="$1"
+    printf '%s/simulation.json\n' "$(simulation_paths "$simulation_id")"
+}
+
+simulation_lock_acquire() {
+    local simulation_id="$1"
+    local lock_file
+    lock_file="$(transition_simulation_lock_file)"
+    ensure_control_path "$lock_file"
+    if [[ ! -d "$(dirname "$lock_file")" ]]; then
+        install -d -o root -g root -m 755 "$(dirname "$lock_file")"
+    fi
+    if ( set -o noclobber; printf 'simulation_id=%s backend=%s pid=%s started_at=%s\n' "$simulation_id" "$EXECUTOR_BACKEND" "$$" "$(utc_now)" > "$lock_file" ) 2>/dev/null; then
+        chmod 600 "$lock_file"
+        return 0
+    fi
+    return 1
+}
+
+simulation_lock_release() {
+    local simulation_id="$1"
+    local lock_file
+    lock_file="$(transition_simulation_lock_file)"
+    if [[ -f "$lock_file" ]] && grep -q "simulation_id=$simulation_id" "$lock_file" 2>/dev/null; then
+        rm -f "$lock_file"
+    fi
+}
+
+simulation_find_preflight() {
+    local transaction_id="$1"
+    if [[ -z "$transaction_id" || "$transaction_id" == "latest" ]]; then
+        require_json_object_file "$(transition_last_preflight_file)" || return 1
+        jq -r '.transition_id // empty' "$(transition_last_preflight_file)"
+        return
+    fi
+    [[ "$transaction_id" =~ ^tx-[0-9TZ]+-[0-9a-f]{12}$ ]] || return 1
+    printf '%s\n' "$transaction_id"
+}
+
+simulation_phase_requires_rollback() {
+    case "$1" in
+        validate|prepare-interface|prepare-profile)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+simulation_phase_json() {
+    local direction="$1"
+    if [[ "$direction" == "NORMAL_TO_FIELD" ]]; then
+        jq -n '[
+          {phase:"validate", order:0, component:"Verifier", description:"Validate transaction, snapshot, recovery plan, and safety invariants.", mutation_equivalent:false, risk:"LOW"},
+          {phase:"prepare-interface", order:1, component:"Interface", description:"Prepare and select the future FIELD wireless interface.", mutation_equivalent:false, risk:"MEDIUM"},
+          {phase:"prepare-profile", order:2, component:"NetworkManager", description:"Prepare the target FIELD NetworkManager profile.", mutation_equivalent:false, risk:"MEDIUM"},
+          {phase:"prepare-routing", order:3, component:"Route", description:"Prepare route preference changes without applying them.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"prepare-firewall", order:4, component:"Firewall", description:"Prepare field firewall policy without applying it.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"verify-management", order:5, component:"Tailscale", description:"Verify management/recovery path would remain available.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"prepare-sidecar", order:6, component:"Sidecar", description:"Ensure NANO remains sidecar-only and never default route.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"prepare-services", order:7, component:"Services", description:"Prepare future field service state changes.", mutation_equivalent:true, risk:"MEDIUM"},
+          {phase:"prepare-mode-metadata", order:8, component:"WARPi mode", description:"Prepare mode/control metadata update.", mutation_equivalent:true, risk:"MEDIUM"},
+          {phase:"verify-target-health", order:9, component:"Health", description:"Verify target FIELD health before commit.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"commit", order:10, component:"Commit", description:"Commit final simulated FIELD transition.", mutation_equivalent:true, risk:"HIGH"}
+        ]'
+    else
+        jq -n '[
+          {phase:"validate", order:0, component:"Verifier", description:"Validate transaction, snapshot, recovery plan, and safety invariants.", mutation_equivalent:false, risk:"LOW"},
+          {phase:"prepare-uplink", order:1, component:"NetworkManager", description:"Prepare restoration of original uplink/profile.", mutation_equivalent:false, risk:"MEDIUM"},
+          {phase:"prepare-addressing", order:2, component:"Addressing", description:"Prepare source interface addressing restoration.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"prepare-routing", order:3, component:"Route", description:"Prepare default route restoration.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"verify-management", order:4, component:"Tailscale", description:"Verify management path remains available.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"prepare-firewall", order:5, component:"Firewall", description:"Prepare firewall policy restoration.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"prepare-sidecar", order:6, component:"Sidecar", description:"Ensure sidecar remains isolated.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"prepare-services", order:7, component:"Services", description:"Prepare service restoration.", mutation_equivalent:true, risk:"MEDIUM"},
+          {phase:"prepare-mode-metadata", order:8, component:"WARPi mode", description:"Prepare NORMAL mode metadata restoration.", mutation_equivalent:true, risk:"MEDIUM"},
+          {phase:"verify-target-health", order:9, component:"Health", description:"Verify target NORMAL health before commit.", mutation_equivalent:true, risk:"HIGH"},
+          {phase:"commit", order:10, component:"Commit", description:"Commit final simulated NORMAL return.", mutation_equivalent:true, risk:"HIGH"}
+        ]'
+    fi
+}
+
+simulation_write_checkpoint() {
+    local simulation_id="$1" source_preflight_id="$2" state="$3" phase="$4" last_action="$5" next_action="$6" rollback_required="$7" rollback_position="$8" result="$9"
+    local checkpoint_path
+    checkpoint_path="$(simulation_checkpoint_path "$simulation_id")"
+    jq -n \
+        --arg schema_version "1" \
+        --arg simulation_id "$simulation_id" \
+        --arg source_preflight_id "$source_preflight_id" \
+        --arg state "$state" \
+        --arg phase "$phase" \
+        --arg last_action "$last_action" \
+        --arg next_action "$next_action" \
+        --arg timestamp "$(utc_now)" \
+        --arg rollback_required "$rollback_required" \
+        --arg rollback_position "$rollback_position" \
+        --arg result "$result" \
+        '{
+          schema_version: ($schema_version|tonumber),
+          simulation_id: $simulation_id,
+          source_preflight_id: $source_preflight_id,
+          state: $state,
+          phase: $phase,
+          last_completed_action: $last_action,
+          next_action: $next_action,
+          timestamp: $timestamp,
+          rollback_required: ($rollback_required == "true"),
+          rollback_position: $rollback_position,
+          result: $result,
+          integrity: {format: "json", backend: "simulation"}
+        }' | atomic_write_json "$checkpoint_path" 640 root "$(transition_read_group)"
+}
+
+simulation_validate_checkpoint() {
+    local checkpoint_path="$1" simulation_id="$2" source_preflight_id="$3" findings_file="$4"
+    if [[ ! -e "$checkpoint_path" ]]; then
+        plan_add_finding "$findings_file" "BLOCK" "checkpoint-missing" "Simulation checkpoint is missing."
+        return
+    fi
+    safe_file_metadata "$checkpoint_path" || plan_add_finding "$findings_file" "BLOCK" "checkpoint-permissions" "Simulation checkpoint ownership or permissions are unsafe."
+    require_json_object_file "$checkpoint_path" || {
+        plan_add_finding "$findings_file" "BLOCK" "checkpoint-malformed" "Simulation checkpoint is malformed."
+        return
+    }
+    [[ "$(jq -r '.schema_version // empty' "$checkpoint_path")" == "1" ]] || plan_add_finding "$findings_file" "BLOCK" "checkpoint-schema" "Simulation checkpoint schema is unsupported."
+    [[ "$(jq -r '.simulation_id // empty' "$checkpoint_path")" == "$simulation_id" ]] || plan_add_finding "$findings_file" "BLOCK" "checkpoint-simulation-mismatch" "Simulation checkpoint ID does not match."
+    [[ "$(jq -r '.source_preflight_id // empty' "$checkpoint_path")" == "$source_preflight_id" ]] || plan_add_finding "$findings_file" "BLOCK" "checkpoint-transaction-mismatch" "Simulation checkpoint preflight correlation does not match."
+    case "$(jq -r '.state // empty' "$checkpoint_path")" in
+        PREPARING|VALIDATING|READY|EXECUTING|CHECKPOINTED|VERIFYING|COMPLETED|FAILED|ROLLBACK_REQUIRED|ROLLING_BACK|ROLLED_BACK|ROLLBACK_FAILED|INTERRUPTED) ;;
+        *) plan_add_finding "$findings_file" "BLOCK" "checkpoint-state-invalid" "Simulation checkpoint state is invalid." ;;
+    esac
+}
+
+simulation_hardware_ready() {
+    find /sys/class/net -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | grep -E '^(wl|wlan)' | grep -v '^wlan0$' | head -n 1
+}
+
+simulation_run() {
+    local action="$1"
+    shift
+    local transaction_id="latest" output_format="human" fail_at="none" rollback_fail_at="none" fixture="live" interrupt_after="none"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --transaction)
+                transaction_id="${2:-}"
+                shift 2
+                ;;
+            --json)
+                output_format="json"
+                shift
+                ;;
+            --fail-at)
+                fail_at="${2:-}"
+                shift 2
+                ;;
+            --rollback-fail-at)
+                rollback_fail_at="${2:-}"
+                shift 2
+                ;;
+            --fixture)
+                fixture="${2:-}"
+                shift 2
+                ;;
+            --interrupt-after)
+                interrupt_after="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Unknown simulate option: $1" >&2
+                echo "Try: warpi mode simulate enter-field --transaction <transition-id>" >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    require_state
+    if [[ "${EUID:-$(id -u)}" -ne 0 && "$(transition_recovery_dir)" != /tmp/* ]]; then
+        if sudo -n true 2>/dev/null; then
+            local sudo_args=(mode simulate "$action" --fixture "$fixture")
+            if [[ "$transaction_id" != "latest" ]]; then sudo_args+=(--transaction "$transaction_id"); fi
+            if [[ "$fail_at" != "none" ]]; then sudo_args+=(--fail-at "$fail_at"); fi
+            if [[ "$rollback_fail_at" != "none" ]]; then sudo_args+=(--rollback-fail-at "$rollback_fail_at"); fi
+            if [[ "$interrupt_after" != "none" ]]; then sudo_args+=(--interrupt-after "$interrupt_after"); fi
+            if [[ "$output_format" == "json" ]]; then sudo_args+=(--json); fi
+            exec sudo -n "$0" "${sudo_args[@]}"
+        fi
+        echo "warpi mode simulate requires root or passwordless sudo for protected simulation metadata writes." >&2
+        exit 1
+    fi
+
+    local direction source_mode target_mode live_mode source_preflight_id snapshot_path recovery_plan_path simulation_id sim_dir findings actions phases events checkpoints started_at completed_at result state rollback_required rollback_result failure_phase hardware_ready hardware_note blockers warnings checkpoint_path history_path last_phase
+    case "$action" in
+        enter-field)
+            direction="NORMAL_TO_FIELD"; source_mode="NORMAL"; target_mode="FIELD" ;;
+        return-normal)
+            direction="FIELD_TO_NORMAL"; source_mode="FIELD"; target_mode="NORMAL" ;;
+        *)
+            echo "Unknown simulate command: $action" >&2
+            exit 2 ;;
+    esac
+
+    source_preflight_id="$(simulation_find_preflight "$transaction_id")" || {
+        echo "No valid preflight transaction selected for simulation." >&2
+        exit 2
+    }
+    snapshot_path="$(snapshot_for_transaction "$source_preflight_id")" || {
+        echo "No valid snapshot selected for simulation." >&2
+        exit 2
+    }
+    recovery_plan_path="$(rollback_plan_for_snapshot "$snapshot_path")"
+    simulation_id="$(generate_simulation_id)"
+    simulation_id_allowed "$simulation_id" || exit 2
+    sim_dir="$(simulation_paths "$simulation_id")"
+    mkdir -p "$sim_dir"
+    chown root:"$(transition_read_group)" "$sim_dir" 2>/dev/null || true
+    chmod 750 "$sim_dir"
+    findings="$(mktemp)"
+    actions="$(mktemp)"
+    events="$(mktemp)"
+    checkpoints="$(mktemp)"
+    phases="$(mktemp)"
+    trap "simulation_lock_release '$simulation_id'; rm -f '$findings' '$actions' '$events' '$checkpoints' '$phases'" EXIT
+
+    if ! simulation_lock_acquire "$simulation_id"; then
+        plan_add_finding "$findings" "BLOCK" "simulation-lock-present" "A simulation lock already exists; refusing conflicting execution."
+    fi
+
+    started_at="$(utc_now)"
+    live_mode="$(json_value '.mode' 'unknown')"
+    [[ "$LIVE_EXECUTOR_ENABLED" == "NO" ]] || plan_add_finding "$findings" "BLOCK" "live-executor-enabled" "Live executor must remain disabled in Milestone D."
+    [[ "$EXECUTOR_BACKEND" == "simulation" ]] || plan_add_finding "$findings" "BLOCK" "backend-not-simulation" "Executor backend is not simulation."
+    [[ -f "$recovery_plan_path" ]] || plan_add_finding "$findings" "BLOCK" "recovery-plan-missing" "Recovery plan is missing; run rollback-plan first."
+    if [[ -f "$recovery_plan_path" ]]; then
+        require_json_object_file "$recovery_plan_path" || plan_add_finding "$findings" "BLOCK" "recovery-plan-malformed" "Recovery plan is malformed."
+        [[ "$(jq -r '.verifier.result // empty' "$recovery_plan_path" 2>/dev/null)" == "PASS" ]] || plan_add_finding "$findings" "BLOCK" "recovery-plan-not-pass" "Recovery plan verifier is not PASS."
+        [[ "$(jq -r '.transaction_id // empty' "$recovery_plan_path" 2>/dev/null)" == "$source_preflight_id" ]] || plan_add_finding "$findings" "BLOCK" "recovery-plan-mismatch" "Recovery plan does not match selected preflight."
+    fi
+    rollback_verify_snapshot "$snapshot_path" "$findings" "$source_preflight_id"
+    [[ "$(jq -r '.transition_direction // empty' "$snapshot_path" 2>/dev/null)" == "$direction" || "$fixture" != "live" ]] || plan_add_finding "$findings" "BLOCK" "direction-mismatch" "Selected preflight direction does not match requested simulation."
+    [[ "$live_mode" == "$source_mode" || "$fixture" != "live" ]] || plan_add_finding "$findings" "BLOCK" "live-source-mode-mismatch" "Live mode is $live_mode but simulation source requires $source_mode."
+    hardware_ready="$(simulation_hardware_ready || true)"
+    hardware_note="real hardware prerequisite satisfied"
+    if [[ "$direction" == "NORMAL_TO_FIELD" && -z "$hardware_ready" ]]; then
+        hardware_note="REAL HARDWARE PREREQUISITE MISSING: no external Wi-Fi adapter beyond wlan0 is enumerated"
+        plan_add_finding "$findings" "WARN" "external-wifi-absent" "$hardware_note. Simulation may proceed only as executor logic validation."
+    fi
+    [[ "$(jq -r '.sidecar.default_route_uses_sidecar // false' "$snapshot_path" 2>/dev/null)" == "false" ]] || plan_add_finding "$findings" "BLOCK" "sidecar-default-route-hazard" "Snapshot indicates sidecar default-route hazard."
+    [[ "$(jq -r '.tailscale.management_path_present // false' "$snapshot_path" 2>/dev/null)" == "true" ]] || plan_add_finding "$findings" "BLOCK" "management-path-missing" "Snapshot does not prove Tailscale management path."
+
+    simulation_phase_json "$direction" > "$phases"
+    state="VALIDATING"
+    result="IN_PROGRESS"
+    rollback_required="false"
+    rollback_result="not-required"
+    last_phase="none"
+    checkpoint_path="$(simulation_checkpoint_path "$simulation_id")"
+    history_path="$(simulation_history_path "$simulation_id")"
+    simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "VALIDATING" "validate" "none" "$(jq -r '.[0].phase' "$phases")" "false" "none" "IN_PROGRESS"
+    printf '%s\n' "$checkpoint_path" >> "$checkpoints"
+
+    blockers="$(preflight_count_findings "$findings" "BLOCK")"
+    if [[ "$blockers" -gt 0 ]]; then
+        state="FAILED"
+        result="BLOCKED"
+    else
+        state="EXECUTING"
+        local phase component description risk mutation next_phase
+        while IFS=$'\t' read -r phase component description risk mutation next_phase; do
+            last_phase="$phase"
+            if [[ "$fail_at" == "$phase" || "$fail_at" == "$component" ]]; then
+                plan_add_finding "$findings" "BLOCK" "injected-failure" "Injected simulation failure at $phase."
+                if [[ "$mutation" == "true" ]] || simulation_phase_requires_rollback "$phase"; then
+                    rollback_required="true"
+                    state="ROLLBACK_REQUIRED"
+                    result="FAILED_ROLLBACK_REQUIRED"
+                else
+                    rollback_required="false"
+                    state="FAILED"
+                    result="FAILED_NO_ROLLBACK_REQUIRED"
+                fi
+                simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "$state" "$phase" "$phase" "$next_phase" "$rollback_required" "pending" "$result"
+                printf '%s\n' "$checkpoint_path" >> "$checkpoints"
+                break
+            fi
+            jq -nc \
+                --arg action_id "$phase" \
+                --arg phase "$phase" \
+                --arg component "$component" \
+                --arg description "$description" \
+                --arg current_state "observed/snapshot-derived" \
+                --arg desired_state "simulated $target_mode target" \
+                --arg behavior "simulated-only" \
+                --arg future_live_operation "disabled-not-callable" \
+                --arg risk "$risk" \
+                --arg management_path_risk "$risk" \
+                --arg rollback_action "use correlated rollback plan if future mutation reaches this phase" \
+                --arg dependencies "prior phases complete; recovery plan PASS; management invariants hold" \
+                '{action_id:$action_id, phase:$phase, component:$component, description:$description, current_state:$current_state, desired_state:$desired_state, simulation_behavior:$behavior, future_live_operation:$future_live_operation, risk_level:$risk, management_path_risk:$management_path_risk, verification_required:true, rollback_action:$rollback_action, dependencies:$dependencies, command_status:"NOT EXECUTED"}' >> "$actions"
+            jq -nc --arg phase "$phase" --arg status "SIMULATED" --arg at "$(utc_now)" '{phase:$phase,status:$status,timestamp:$at}' >> "$events"
+            simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "CHECKPOINTED" "$phase" "$phase" "$next_phase" "false" "none" "IN_PROGRESS"
+            printf '%s\n' "$checkpoint_path" >> "$checkpoints"
+            if [[ "$interrupt_after" == "$phase" ]]; then
+                state="INTERRUPTED"
+                result="INTERRUPTED"
+                simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "$state" "$phase" "$phase" "$next_phase" "false" "none" "$result"
+                break
+            fi
+        done < <(jq -r 'to_entries[] as $e | [$e.value.phase,$e.value.component,$e.value.description,$e.value.risk,($e.value.mutation_equivalent|tostring),(.[$e.key + 1].phase // "none")] | @tsv' "$phases")
+        if [[ "$result" == "IN_PROGRESS" ]]; then
+            state="COMPLETED"
+            result="COMPLETED"
+            simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "COMPLETED" "commit" "commit" "none" "false" "none" "$result"
+        fi
+    fi
+
+    if [[ "$rollback_required" == "true" ]]; then
+        local recovery_actions recovery_count idx recovery_component recovery_phase
+        recovery_actions="$(mktemp)"
+        jq -c '.recovery_plan.actions[]?' "$recovery_plan_path" > "$recovery_actions" 2>/dev/null || true
+        recovery_count="$(wc -l < "$recovery_actions" | tr -d ' ')"
+        idx=0
+        rollback_result="ROLLED_BACK"
+        state="ROLLING_BACK"
+        while IFS= read -r recovery_action; do
+            idx=$((idx + 1))
+            recovery_component="$(jq -r '.component // "Recovery"' <<<"$recovery_action")"
+            recovery_phase="$(jq -r '.phase // "rollback"' <<<"$recovery_action")"
+            if [[ "$rollback_fail_at" == "$recovery_component" || "$rollback_fail_at" == "$recovery_phase" || "$rollback_fail_at" == "rollback" ]]; then
+                plan_add_finding "$findings" "BLOCK" "rollback-injected-failure" "Injected rollback failure at $recovery_phase / $recovery_component. Manual recovery escalation required."
+                rollback_result="ROLLBACK_FAILED"
+                state="ROLLBACK_FAILED"
+                result="ROLLBACK_FAILED"
+                simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "ROLLBACK_FAILED" "$recovery_phase" "$recovery_component" "manual-review" "true" "$idx/$recovery_count" "$result"
+                break
+            fi
+            jq -nc --arg phase "$recovery_phase" --arg component "$recovery_component" --arg status "ROLLBACK_SIMULATED" --arg at "$(utc_now)" '{phase:$phase,component:$component,status:$status,timestamp:$at,command_status:"NOT EXECUTED"}' >> "$events"
+            simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "ROLLING_BACK" "$recovery_phase" "$recovery_component" "next-rollback-action" "true" "$idx/$recovery_count" "ROLLING_BACK"
+        done < "$recovery_actions"
+        rm -f "$recovery_actions"
+        if [[ "$rollback_result" == "ROLLED_BACK" ]]; then
+            state="ROLLED_BACK"
+            result="ROLLED_BACK"
+            simulation_write_checkpoint "$simulation_id" "$source_preflight_id" "ROLLED_BACK" "rollback-complete" "rollback-complete" "none" "true" "complete" "$result"
+        fi
+    fi
+
+    completed_at="$(utc_now)"
+    simulation_validate_checkpoint "$checkpoint_path" "$simulation_id" "$source_preflight_id" "$findings"
+    blockers="$(preflight_count_findings "$findings" "BLOCK")"
+    warnings="$(preflight_count_findings "$findings" "WARN")"
+    if [[ "$blockers" -gt 0 && "$result" == "COMPLETED" ]]; then
+        result="BLOCKED"
+        state="FAILED"
+    fi
+
+    jq -n \
+        --arg schema_version "1" \
+        --arg simulation_id "$simulation_id" \
+        --arg source_preflight_id "$source_preflight_id" \
+        --arg snapshot_path "$snapshot_path" \
+        --arg recovery_plan_path "$recovery_plan_path" \
+        --arg direction "$direction" \
+        --arg source_mode "$source_mode" \
+        --arg target_mode "$target_mode" \
+        --arg backend "$EXECUTOR_BACKEND" \
+        --arg live_enabled "$LIVE_EXECUTOR_ENABLED" \
+        --arg state "$state" \
+        --arg result "$result" \
+        --arg started_at "$started_at" \
+        --arg completed_at "$completed_at" \
+        --arg fail_at "$fail_at" \
+        --arg rollback_fail_at "$rollback_fail_at" \
+        --arg rollback_required "$rollback_required" \
+        --arg rollback_result "$rollback_result" \
+        --arg hardware_note "$hardware_note" \
+        --arg last_checkpoint "$checkpoint_path" \
+        --arg blockers "$blockers" \
+        --arg warnings "$warnings" \
+        --arg actions_planned "$(jq 'length' "$phases")" \
+        --arg actions_simulated "$(wc -l < "$actions" | tr -d ' ')" \
+        --argjson findings_json "$(preflight_findings_json "$findings")" \
+        --argjson phases_json "$(jq '.' "$phases")" \
+        --argjson actions_json "$(preflight_findings_json "$actions")" \
+        --argjson events_json "$(preflight_findings_json "$events")" \
+        '{
+          schema_version: ($schema_version|tonumber),
+          simulation_id: $simulation_id,
+          source_preflight_id: $source_preflight_id,
+          source_snapshot_path: $snapshot_path,
+          source_recovery_plan_path: $recovery_plan_path,
+          direction: $direction,
+          source_mode: $source_mode,
+          target_mode: $target_mode,
+          backend: $backend,
+          live_executor_enabled: ($live_enabled == "YES"),
+          state: $state,
+          result: $result,
+          started_at: $started_at,
+          updated_at: $completed_at,
+          completed_at: $completed_at,
+          failure_injected: ($fail_at != "none"),
+          failure_phase: $fail_at,
+          rollback_failure_injected: ($rollback_fail_at != "none"),
+          rollback_required: ($rollback_required == "true"),
+          rollback_started: ($rollback_required == "true"),
+          rollback_completed: ($rollback_result == "ROLLED_BACK"),
+          rollback_result: $rollback_result,
+          hardware_readiness_note: $hardware_note,
+          last_checkpoint: $last_checkpoint,
+          actions_planned: ($actions_planned|tonumber),
+          actions_simulated: ($actions_simulated|tonumber),
+          blocker_count: ($blockers|tonumber),
+          warning_count: ($warnings|tonumber),
+          blockers: $findings_json,
+          warnings: [$findings_json[] | select(.level == "WARN")],
+          phases: $phases_json,
+          simulated_actions: $actions_json,
+          history: $events_json,
+          apply_gate: "simulation-only executor; live apply remains disabled"
+        }' | atomic_write_json "$history_path" 640 root "$(transition_read_group)"
+
+    atomic_write_json "$(transition_last_simulation_file)" 640 root "$(transition_read_group)" < "$history_path"
+    simulation_lock_release "$simulation_id"
+
+    if [[ "$output_format" == "json" ]]; then
+        jq '.' "$history_path"
+        return
+    fi
+    simulation_report "$history_path"
+}
+
+simulation_report() {
+    local history_path="$1"
+    echo
+    echo "============================================================"
+    echo "          WARPi MODE EXECUTOR SIMULATION"
+    echo "============================================================"
+    echo
+    echo "SIMULATION ONLY. NO LIVE CHANGES WILL BE MADE."
+    echo
+    printf "%-30s %s\n" "Simulation ID:" "$(jq -r '.simulation_id' "$history_path")"
+    printf "%-30s %s\n" "Originating preflight:" "$(jq -r '.source_preflight_id' "$history_path")"
+    printf "%-30s %s\n" "Backend:" "$(jq -r '.backend' "$history_path")"
+    printf "%-30s %s\n" "Live executor enabled:" "$(jq -r '.live_executor_enabled' "$history_path")"
+    printf "%-30s %s\n" "Direction:" "$(jq -r '.direction' "$history_path")"
+    printf "%-30s %s\n" "Result:" "$(jq -r '.result' "$history_path")"
+    printf "%-30s %s\n" "State:" "$(jq -r '.state' "$history_path")"
+    printf "%-30s %s\n" "Actions planned:" "$(jq -r '.actions_planned' "$history_path")"
+    printf "%-30s %s\n" "Actions simulated:" "$(jq -r '.actions_simulated' "$history_path")"
+    printf "%-30s %s\n" "Rollback required:" "$(jq -r '.rollback_required' "$history_path")"
+    printf "%-30s %s\n" "Rollback result:" "$(jq -r '.rollback_result' "$history_path")"
+    printf "%-30s %s\n" "Blockers:" "$(jq -r '.blocker_count' "$history_path")"
+    printf "%-30s %s\n" "Warnings:" "$(jq -r '.warning_count' "$history_path")"
+    printf "%-30s %s\n" "Hardware readiness:" "$(jq -r '.hardware_readiness_note' "$history_path")"
+    printf "%-30s %s\n" "Last checkpoint:" "$(jq -r '.last_checkpoint' "$history_path")"
+    echo
+    echo "FINDINGS"
+    echo "------------------------------------------------------------"
+    if [[ "$(jq -r '.blockers | length' "$history_path")" -eq 0 ]]; then
+        echo "No simulation findings."
+    else
+        jq -r '.blockers[] | "- [" + .level + "] " + .code + ": " + .message' "$history_path"
+    fi
+    echo
+    echo "SIMULATED ACTIONS - NOT EXECUTED"
+    echo "------------------------------------------------------------"
+    jq -r '.simulated_actions[]? | "- " + .phase + " / " + .component + ": " + .description + " [" + .command_status + "]"' "$history_path"
+    echo
+    echo "============================================================"
+}
+
+simulation_status() {
+    local output_format="${1:-human}"
+    local path
+    path="$(transition_last_simulation_file)"
+    if [[ "$output_format" == "--json" || "$output_format" == "json" ]]; then
+        if require_json_object_file "$path"; then
+            jq '.' "$path"
+        else
+            jq -n --arg backend "$EXECUTOR_BACKEND" --arg live "$LIVE_EXECUTOR_ENABLED" '{schema_version:1, backend:$backend, live_executor_enabled:($live=="YES"), status:"absent"}'
+        fi
+        return
+    fi
+    if require_json_object_file "$path"; then
+        simulation_report "$path"
+    else
+        echo
+        echo "============================================================"
+        echo "          WARPi MODE EXECUTOR SIMULATION"
+        echo "============================================================"
+        echo
+        printf "%-30s %s\n" "Executor backend:" "$EXECUTOR_BACKEND"
+        printf "%-30s %s\n" "Live executor enabled:" "$LIVE_EXECUTOR_ENABLED"
+        printf "%-30s %s\n" "Last simulation:" "absent"
+        echo
+        echo "============================================================"
+    fi
 }
 
 mode_status() {
@@ -2083,6 +2705,36 @@ case "${1:-help}" in
                 ;;
             rollback-plan)
                 transition_rollback_plan "${@:3}"
+                ;;
+            simulate)
+                case "${3:-}" in
+                    enter-field|return-normal)
+                        simulation_run "$3" "${@:4}"
+                        ;;
+                    help|-h|--help)
+                        usage
+                        ;;
+                    *)
+                        echo "Unknown simulate command: ${3:-}" >&2
+                        echo "Try: warpi mode simulate enter-field" >&2
+                        exit 2
+                        ;;
+                esac
+                ;;
+            simulate-status)
+                case "${3:-}" in
+                    ""|--human)
+                        simulation_status human
+                        ;;
+                    --json)
+                        simulation_status json
+                        ;;
+                    *)
+                        echo "Unknown simulate-status option: $3" >&2
+                        echo "Try: warpi mode simulate-status" >&2
+                        exit 2
+                        ;;
+                esac
                 ;;
             enter-field)
                 case "${3:-}" in

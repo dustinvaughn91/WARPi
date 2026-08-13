@@ -286,7 +286,72 @@ Milestone C plans are preview-only. They do not execute commands, change routes,
 
 Milestone C external Wi-Fi adapter finding: live read-only inspection at CLS showed only `wlan0` as a wireless netdev. `lsusb` showed the root hubs, VIA hub, and ASIX AX88772A sidecar Ethernet, but no separate external Wi-Fi adapter enumeration. `ip link` and NetworkManager device state did not show an additional wireless interface. Current evidence points to hardware not being detected by Linux at that moment, rather than WARPi detection logic missing an existing netdev. No driver reloads, scans, radio changes, or NetworkManager restarts were performed.
 
-The next milestone should be a staged mutating executor behind an explicit hard safety gate, with phase checkpoints, management-path verification, and automatic rollback logic. It should begin in an executor simulation mode before any real `--apply` path is approved.
+## Milestone D Executor Simulation
+
+Milestone D adds the simulation-only staged executor commands:
+
+- `warpi mode simulate enter-field`
+- `warpi mode simulate return-normal`
+- `warpi mode simulate enter-field --transaction <preflight-id>`
+- `warpi mode simulate enter-field --fail-at <phase>`
+- `warpi mode simulate enter-field --rollback-fail-at <phase>`
+- `warpi mode simulate enter-field --json`
+- `warpi mode simulate-status`
+
+The executor backend model is explicit:
+
+- `backend = simulation`
+- `live_executor_enabled = false`
+
+No live backend is callable in Milestone D. There is no `--real`, `--force-live`, `--unsafe`, `--experimental-apply`, `--bypass`, or environment override for live execution.
+
+Each simulation creates a distinct `sim-<timestamp>-<random>` transaction correlated with the originating preflight transaction. Simulation artifacts live under:
+
+- `/var/lib/warpi/mode-transitions/<simulation-id>/simulation.json`
+- `/var/lib/warpi/mode-transitions/<simulation-id>/executor-checkpoint.json`
+- `/var/lib/warpi/mode-transitions/last-simulation.json`
+
+Simulation metadata tracks schema version, simulation ID, source preflight ID, snapshot path, recovery-plan path, direction, source/target mode, backend, state, result, timestamps, failure injection, rollback decision, rollback result, planned/simulated action counts, blockers/warnings, phases, simulated actions, and event history.
+
+Checkpoint schema version 1 includes simulation ID, source preflight ID, state, phase, last completed action, next action, timestamp, rollback-required flag, rollback position, result, and integrity metadata. Resume/continuation is not a live executor path; corrupted or contradictory checkpoints block status/resume decisions and require review.
+
+NORMAL -> FIELD simulation phases:
+
+1. `validate`: verify transaction, snapshot, recovery plan, and safety invariants.
+2. `prepare-interface`: prepare and select the future FIELD wireless interface.
+3. `prepare-profile`: prepare the target FIELD NetworkManager profile.
+4. `prepare-routing`: prepare route preference changes.
+5. `prepare-firewall`: prepare field firewall policy.
+6. `verify-management`: verify management/recovery path.
+7. `prepare-sidecar`: ensure NANO remains sidecar-only.
+8. `prepare-services`: prepare field service changes.
+9. `prepare-mode-metadata`: prepare mode/control metadata update.
+10. `verify-target-health`: verify target FIELD health before commit.
+11. `commit`: commit final simulated FIELD transition.
+
+FIELD -> NORMAL simulation uses the corresponding restoration sequence: validate, prepare original uplink, prepare addressing, prepare routing, verify management, prepare firewall, prepare sidecar isolation, prepare service restoration, prepare mode metadata, verify target health, and commit.
+
+Each action records action ID, phase, component, description, current state, desired state, `simulation_behavior`, `future_live_operation: disabled-not-callable`, risk level, management-path risk, verification requirement, rollback action, dependencies, and `command_status: NOT EXECUTED`.
+
+Automatic rollback decisioning is explicit:
+
+- Failures in validation/interface/profile preparation do not require rollback because no future mutation-equivalent phase has been reached.
+- Failures in routing, firewall, management verification, sidecar, services, mode metadata, target health, or commit require simulated rollback using the Milestone C recovery plan.
+- Rollback failure injection produces `ROLLBACK_FAILED` and manual recovery escalation.
+
+Management-path invariants:
+
+- Tailscale management path cannot be intentionally destroyed before an alternate verified path exists.
+- Current uplink cannot be removed before target uplink validation where possible.
+- Default route cannot be changed blindly.
+- NANO/sidecar cannot become the default route.
+- Firewall changes cannot precede recovery/management-path safety checks if they could block access.
+- Mode metadata cannot be committed before health verification passes.
+- Rollback metadata must validate before any future mutating phase starts.
+
+The external Wi-Fi adapter remains a real hardware prerequisite for FIELD readiness. If no extra Wi-Fi interface beyond `wlan0` is enumerated, the simulator reports `REAL HARDWARE PREREQUISITE MISSING` and treats the run as executor-logic validation only.
+
+The next milestone should be Milestone E: staged real action adapters behind a hard manual safety gate, still default-disabled. Milestone E must not authorize end-to-end live Field Mode until external Wi-Fi hardware is present and validated, boot/interruption recovery is implemented, rollback execution is proven in a controlled local test, a management-path watchdog exists, and Dustin explicitly approves a staged live test.
 
 ## Future Runtime Mode State Machine
 
