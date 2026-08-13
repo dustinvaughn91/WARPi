@@ -100,7 +100,7 @@ The API exposes unauthenticated `/health` for dependency status and authenticate
 
 The previous TCP/8000 refusal was caused by `mission-api` crash-looping during startup while attempting to resolve/connect to the `postgres` service. PostgreSQL and Redis were healthy; an API-only Docker Compose recreate/rebuild restored Docker network membership and health without touching persistent volumes. The repaired API initializes `devices`, `warpi_device_state`, and `warpi_heartbeats` non-destructively, upserts by stable WARPi device identity, records heartbeat history, and rejects unauthenticated, malformed, missing-field, and invalid-device requests.
 
-Routine Proxmox token access is still intentionally denied for protected VM `110`, so VM startup/onboot and backup status require separate PVE-side verification. No Mission Control outage should be allowed to become a WARPi operating dependency.
+Read-only PVE-side inspection identifies `mission01` as protected VM `110` on `pve01` with guest agent enabled, 2 vCPU, 8 GiB RAM, a 64 GiB `local-lvm` disk, and a single `vmbr1` virtio NIC. No `onboot` flag was present in the VM config, no cluster backup jobs were returned, and no recent local dump files for VM `110` were found under `/var/lib/vz/dump` during the 2026-08-13 check. Startup policy and backup coverage should be corrected before treating Mission Control as production-recoverable. No Mission Control outage should be allowed to become a WARPi operating dependency.
 
 ## Wireless Sidecar Model
 

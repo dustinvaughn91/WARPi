@@ -13,7 +13,8 @@
 - Define the K.E.R.N.E.L./WARPi command contract.
 - Keep `warpi mode enter-field` and `warpi mode return-normal` in dry-run planner mode until the apply workflow and recovery path are explicitly approved.
 - Put Mission Control server source/configuration under a canonical Git repository; `/srv/mission-control` is currently a live deployment path, not a Git working tree.
-- Verify Mission Control VM startup/onboot and backup coverage from the PVE side; routine protected-VM audit access remains restricted.
+- Enable and document Mission Control VM startup/onboot behavior if desired; 2026-08-13 read-only PVE config did not show an `onboot` flag for VM `110`.
+- Create and document Mission Control backup coverage; 2026-08-13 read-only PVE inspection returned no cluster backup jobs and no recent local dump files for VM `110`.
 - Define an application-aware PostgreSQL backup/restore procedure for Mission Control device/mission state.
 - Build staged real action adapters behind an explicit hard manual safety gate, still default-disabled, before any real mode apply path is approved.
 - Implement the reversible mode-transition design in staged milestones; Milestone A transition-status, Milestone B preflight rollback-snapshot capture, Milestone C rollback planning, and Milestone D executor simulation are complete, while live apply remains gated.
