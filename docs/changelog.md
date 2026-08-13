@@ -26,3 +26,7 @@
 - Validated that `kernel-report` reports the dispatcher, both dry-run planners, and the gated apply workflow; validated that `kernel-doc-audit` no longer treats missing legacy user-home scripts as current requirements.
 - Documented the live documentation source-of-truth model, added `bin/warpi-docs-sync`, and taught `kernel-doc-audit` to validate the deployed documentation manifest under `/opt/warpi/docs`.
 - Added the reversible mode-transition design for future real `enter-field --apply` and `return-normal --apply` work. Apply mode remains disabled.
+
+## 2026-08-13
+
+- Added `warpi wireless status` as a read-only WiFi Pineapple NANO sidecar reachability check. The command reports interface state, sidecar route, ping reachability, management UI TCP reachability, default-route safety, and confirms wireless actions remain disabled.

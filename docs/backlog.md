@@ -20,7 +20,7 @@
 ## P2
 
 - Design optional WiFi Pineapple NANO backend.
-- Detect NANO attachment safely.
+- Detect NANO attachment safely through `warpi wireless status`.
 - Query NANO status without active wireless behavior.
 - Prototype passive authorized survey workflow.
 

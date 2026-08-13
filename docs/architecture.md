@@ -27,6 +27,7 @@ User-facing status is provided by:
 - `warpi mode status`
 - `warpi mode enter-field` dry-run plan
 - `warpi mode return-normal` dry-run plan
+- `warpi wireless status` read-only sidecar reachability
 - `warpi-status`
 - `kernel-report --json`
 - TFT display state/detail files
@@ -48,6 +49,10 @@ See [mode-control investigation](mode-control-investigation.md).
 
 Future real mode switching must follow the reversible transaction design in [mode transition design](mode-transition-design.md). That design keeps remote management survivability as a primary safety property and requires state-machine, rollback, boot recovery, observability, and staged tests before apply mode can be enabled.
 
+## Wireless Sidecar Model
+
+The WiFi Pineapple NANO is treated as an optional sidecar, not a default route or required dependency. `warpi wireless status` performs read-only checks for the sidecar interface, NANO management address, management UI TCP reachability, and default-route safety. It does not start scans, change radios, alter routes, or modify NANO configuration.
+
 ## Diagram
 
 ```mermaid
@@ -67,5 +72,5 @@ flowchart TD
     State --> Reports[kernel-report / warpi-status]
     Reports --> Kernel
 
-    Nano[Optional WiFi Pineapple NANO] -. future optional wireless backend .-> WARPi
+    Nano[Optional WiFi Pineapple NANO] -. read-only sidecar status / future backend .-> WARPi
 ```

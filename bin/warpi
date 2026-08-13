@@ -6,6 +6,9 @@ CONFIG_FILE="/etc/warpi/kernel.conf"
 KERNEL_SERVICE="warpi-kernel.service"
 FIELD_PROFILE="WARPi-Field"
 FIELD_MARKER="/tmp/warpi_fieldmode"
+NANO_INTERFACE="eth1"
+NANO_HOST="172.16.42.1"
+NANO_UI_PORT="1471"
 
 config_value() {
     local key="$1"
@@ -60,6 +63,7 @@ Usage:
   warpi mode status
   warpi mode enter-field
   warpi mode return-normal
+  warpi wireless status
   warpi field health
   warpi field setup
   warpi report
@@ -71,6 +75,7 @@ Commands:
   mode status       Show current NORMAL/FIELD mode state.
   mode enter-field  Show the Field Mode transition plan without changing state.
   mode return-normal Show the Normal Mode transition plan without changing state.
+  wireless status   Show read-only WiFi Pineapple NANO sidecar reachability.
   field health      Show field-mode network and service health.
   field setup       Prepare field-mode networking/firewall support.
   report            Emit kernel-report JSON.
@@ -78,6 +83,9 @@ Commands:
 
 Mode switching:
   enter-field and return-normal are dry-run only. Apply mode is intentionally not enabled yet.
+
+Wireless:
+  wireless status is read-only. It does not start scans, change radios, or modify NANO state.
 EOF
 }
 
@@ -322,6 +330,85 @@ mode_return_normal_plan() {
     echo "============================================================"
 }
 
+wireless_status() {
+    local interface="${WARPI_NANO_INTERFACE:-$NANO_INTERFACE}"
+    local host="${WARPI_NANO_HOST:-$NANO_HOST}"
+    local port="${WARPI_NANO_UI_PORT:-$NANO_UI_PORT}"
+    local link_state addr route default_route default_iface default_ok
+    local ping_status tcp_status nm_state nm_connection wireless_actions
+
+    link_state="$(ip -br link show "$interface" 2>/dev/null | awk '{print $2}' || true)"
+    addr="$(ip -br addr show "$interface" 2>/dev/null | awk '{print $3}' || true)"
+    route="$(ip route get "$host" 2>/dev/null | head -n 1 || true)"
+    default_route="$(ip route show default 2>/dev/null | head -n 1 || true)"
+    default_iface="$(awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' <<<"$default_route" | head -n 1)"
+    nm_state="$(nmcli -t -f GENERAL.STATE device show "$interface" 2>/dev/null | cut -d: -f2- || true)"
+    nm_connection="$(nmcli -t -f GENERAL.CONNECTION device show "$interface" 2>/dev/null | cut -d: -f2- || true)"
+    wireless_actions="disabled"
+
+    if [[ -z "$link_state" ]]; then
+        link_state="missing"
+    fi
+    if [[ -z "$addr" ]]; then
+        addr="none"
+    fi
+    if [[ -z "$route" ]]; then
+        route="none"
+    fi
+    if [[ -z "$default_route" ]]; then
+        default_route="none"
+    fi
+    if [[ -z "$default_iface" ]]; then
+        default_iface="unknown"
+    fi
+    if [[ -z "$nm_state" ]]; then
+        nm_state="unknown"
+    fi
+    if [[ -z "$nm_connection" ]]; then
+        nm_connection="unknown"
+    fi
+
+    if [[ "$default_iface" == "$interface" ]]; then
+        default_ok="NO"
+    else
+        default_ok="YES"
+    fi
+
+    if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
+        ping_status="reachable"
+    else
+        ping_status="unreachable"
+    fi
+
+    if timeout 4 bash -c ":</dev/tcp/$host/$port" >/dev/null 2>&1; then
+        tcp_status="open"
+    else
+        tcp_status="closed-or-unreachable"
+    fi
+
+    echo
+    echo "============================================================"
+    echo "              WARPi WIRELESS SIDECAR"
+    echo "============================================================"
+    echo
+    echo "Read-only status. No scans, radios, routes, services, or NANO settings were changed."
+    echo
+    printf "%-24s %s\n" "Sidecar target:" "$host:$port"
+    printf "%-24s %s\n" "Interface:" "$interface"
+    printf "%-24s %s\n" "Link state:" "$link_state"
+    printf "%-24s %s\n" "Address:" "$addr"
+    printf "%-24s %s\n" "NetworkManager state:" "$nm_state"
+    printf "%-24s %s\n" "NetworkManager conn:" "$nm_connection"
+    printf "%-24s %s\n" "Route to sidecar:" "$route"
+    printf "%-24s %s\n" "Ping:" "$ping_status"
+    printf "%-24s %s\n" "UI TCP $port:" "$tcp_status"
+    printf "%-24s %s\n" "Default route:" "$default_route"
+    printf "%-24s %s\n" "Default avoids sidecar:" "$default_ok"
+    printf "%-24s %s\n" "Wireless actions:" "$wireless_actions"
+    echo
+    echo "============================================================"
+}
+
 case "${1:-help}" in
     help|-h|--help)
         usage
@@ -372,6 +459,21 @@ case "${1:-help}" in
             *)
                 echo "Unknown mode command: ${2:-}" >&2
                 echo "Try: warpi mode status" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    wireless)
+        case "${2:-status}" in
+            status)
+                wireless_status
+                ;;
+            help|-h|--help)
+                usage
+                ;;
+            *)
+                echo "Unknown wireless command: ${2:-}" >&2
+                echo "Try: warpi wireless status" >&2
                 exit 2
                 ;;
         esac
