@@ -30,3 +30,5 @@
 ## 2026-08-13
 
 - Added `warpi wireless status` as a read-only WiFi Pineapple NANO sidecar reachability check. The command reports interface state, sidecar route, ping reachability, management UI TCP reachability, default-route safety, and confirms wireless actions remain disabled.
+- Added Milestone A mode-transition control-plane status through `warpi mode transition-status`, including human-readable and JSON output for transition state, active transaction detection, direction, lock status, transaction metadata paths, rollback metadata, validation status, and the current apply gate.
+- Integrated the transition framework summary into the existing `warpi mode enter-field` and `warpi mode return-normal` dry-run planners without creating live transition metadata or enabling `--apply`.

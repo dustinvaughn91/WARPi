@@ -1,14 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-STATE_FILE="/run/warpi/state.json"
-CONFIG_FILE="/etc/warpi/kernel.conf"
-KERNEL_SERVICE="warpi-kernel.service"
-FIELD_PROFILE="WARPi-Field"
-FIELD_MARKER="/tmp/warpi_fieldmode"
-NANO_INTERFACE="eth1"
-NANO_HOST="172.16.42.1"
-NANO_UI_PORT="1471"
+STATE_FILE="${STATE_FILE:-/run/warpi/state.json}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/warpi/kernel.conf}"
+KERNEL_SERVICE="${KERNEL_SERVICE:-warpi-kernel.service}"
+FIELD_PROFILE="${FIELD_PROFILE:-WARPi-Field}"
+FIELD_MARKER="${FIELD_MARKER:-/tmp/warpi_fieldmode}"
+NANO_INTERFACE="${NANO_INTERFACE:-eth1}"
+NANO_HOST="${NANO_HOST:-172.16.42.1}"
+NANO_UI_PORT="${NANO_UI_PORT:-1471}"
+TRANSITION_LOCK_FILE="${TRANSITION_LOCK_FILE:-/run/warpi/mode-transition.lock}"
+TRANSITION_STATE_FILE="${TRANSITION_STATE_FILE:-/run/warpi/mode-transition-state.json}"
+TRANSITION_CURRENT_FILE="${TRANSITION_CURRENT_FILE:-/run/warpi/mode-transition-current.json}"
+TRANSITION_RECOVERY_DIR="${TRANSITION_RECOVERY_DIR:-/var/lib/warpi/mode-transitions}"
+TRANSITION_ROLLBACK_FILE="${TRANSITION_ROLLBACK_FILE:-/var/lib/warpi/mode-transitions/rollback-plan.json}"
+TRANSITION_PENDING_FILE="${TRANSITION_PENDING_FILE:-/var/lib/warpi/mode-transitions/pending-transition.json}"
+TRANSITION_APPLY_GATE="apply mode is disabled until transaction execution, rollback, boot recovery, and staged live tests are approved"
 
 config_value() {
     local key="$1"
@@ -61,6 +68,7 @@ Usage:
   warpi help
   warpi status
   warpi mode status
+  warpi mode transition-status
   warpi mode enter-field
   warpi mode return-normal
   warpi wireless status
@@ -73,6 +81,8 @@ Commands:
   help              Show this menu.
   status            Show full WARPi K.E.R.N.E.L. status.
   mode status       Show current NORMAL/FIELD mode state.
+  mode transition-status
+                    Show read-only mode-transition state, lock, and rollback status.
   mode enter-field  Show the Field Mode transition plan without changing state.
   mode return-normal Show the Normal Mode transition plan without changing state.
   wireless status   Show read-only WiFi Pineapple NANO sidecar reachability.
@@ -83,6 +93,7 @@ Commands:
 
 Mode switching:
   enter-field and return-normal are dry-run only. Apply mode is intentionally not enabled yet.
+  transition-status is read-only and supports --json for machine-readable output.
 
 Wireless:
   wireless status is read-only. It does not start scans, change radios, or modify NANO state.
@@ -95,6 +106,375 @@ require_state() {
         systemctl is-active "$KERNEL_SERVICE" 2>/dev/null || true
         exit 1
     fi
+}
+
+transition_lock_file() {
+    printf '%s\n' "${WARPI_TRANSITION_LOCK_FILE:-$TRANSITION_LOCK_FILE}"
+}
+
+transition_state_file() {
+    printf '%s\n' "${WARPI_TRANSITION_STATE_FILE:-$TRANSITION_STATE_FILE}"
+}
+
+transition_current_file() {
+    printf '%s\n' "${WARPI_TRANSITION_CURRENT_FILE:-$TRANSITION_CURRENT_FILE}"
+}
+
+transition_rollback_file() {
+    printf '%s\n' "${WARPI_TRANSITION_ROLLBACK_FILE:-$TRANSITION_ROLLBACK_FILE}"
+}
+
+transition_pending_file() {
+    printf '%s\n' "${WARPI_TRANSITION_PENDING_FILE:-$TRANSITION_PENDING_FILE}"
+}
+
+transition_state_allowed() {
+    case "$1" in
+        IDLE|PREPARING|VALIDATING|READY|APPLYING|VERIFYING|COMPLETED|ROLLING_BACK|ROLLED_BACK|FAILED)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+transition_direction_allowed() {
+    case "$1" in
+        ""|"none"|"NORMAL_TO_FIELD"|"FIELD_TO_NORMAL"|"NORMAL -> FIELD"|"FIELD -> NORMAL")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+transition_active_state() {
+    case "$1" in
+        PREPARING|VALIDATING|READY|APPLYING|VERIFYING|ROLLING_BACK)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+transition_file_status() {
+    local path="$1"
+
+    if [[ -L "$path" ]]; then
+        echo "unsafe-symlink"
+    elif [[ -e "$path" ]]; then
+        echo "present"
+    else
+        echo "absent"
+    fi
+}
+
+transition_json_value() {
+    local file="$1"
+    local expression="$2"
+    local fallback="${3:-none}"
+
+    jq -r "$expression // \"$fallback\"" "$file" 2>/dev/null || printf '%s\n' "$fallback"
+}
+
+transition_status_values() {
+    require_state
+
+    local lock_file state_file current_file rollback_file pending_file
+    local mode state_file_status current_file_status rollback_status pending_status lock_status
+    local transition_state transition_active direction transition_id source_mode target_mode
+    local started_at updated_at completed_at failure_reason rollback_available
+    local last_attempted last_completed last_result last_event validation_status blockers
+    local apply_prereqs apply_eligible unsafe_reasons lock_detail
+
+    lock_file="$(transition_lock_file)"
+    state_file="$(transition_state_file)"
+    current_file="$(transition_current_file)"
+    rollback_file="$(transition_rollback_file)"
+    pending_file="$(transition_pending_file)"
+    mode="$(json_value '.mode')"
+
+    lock_status="$(transition_file_status "$lock_file")"
+    state_file_status="$(transition_file_status "$state_file")"
+    current_file_status="$(transition_file_status "$current_file")"
+    rollback_status="$(transition_file_status "$rollback_file")"
+    pending_status="$(transition_file_status "$pending_file")"
+
+    transition_state="IDLE"
+    transition_active="NO"
+    direction="none"
+    transition_id="none"
+    source_mode="none"
+    target_mode="none"
+    started_at="none"
+    updated_at="none"
+    completed_at="none"
+    failure_reason="none"
+    rollback_available="NO"
+    last_attempted="none"
+    last_completed="none"
+    last_result="none"
+    last_event="none"
+    validation_status="clean"
+    blockers="none"
+    unsafe_reasons=""
+    lock_detail="none"
+
+    if [[ "$lock_status" == "unsafe-symlink" ]]; then
+        unsafe_reasons="${unsafe_reasons}lock path is a symlink; "
+        lock_detail="unsafe symlink"
+    elif [[ "$lock_status" == "present" ]]; then
+        lock_detail="$(head -n 1 "$lock_file" 2>/dev/null || echo unreadable)"
+    fi
+
+    if [[ "$state_file_status" == "unsafe-symlink" || "$current_file_status" == "unsafe-symlink" ]]; then
+        unsafe_reasons="${unsafe_reasons}transition metadata path is a symlink; "
+    fi
+
+    if [[ "$state_file_status" == "present" ]]; then
+        if jq -e . "$state_file" >/dev/null 2>&1; then
+            transition_state="$(transition_json_value "$state_file" '.state' 'IDLE')"
+            direction="$(transition_json_value "$state_file" '.direction' 'none')"
+            transition_id="$(transition_json_value "$state_file" '.transition_id' 'none')"
+            source_mode="$(transition_json_value "$state_file" '.source_mode' 'none')"
+            target_mode="$(transition_json_value "$state_file" '.target_mode' 'none')"
+            started_at="$(transition_json_value "$state_file" '.started_at' 'none')"
+            updated_at="$(transition_json_value "$state_file" '.updated_at' 'none')"
+            completed_at="$(transition_json_value "$state_file" '.completed_at' 'none')"
+            failure_reason="$(transition_json_value "$state_file" '.failure_reason' 'none')"
+            rollback_available="$(transition_json_value "$state_file" '.rollback_available' 'false')"
+            last_attempted="$(transition_json_value "$state_file" '.last_attempted_transition' "$direction")"
+            last_completed="$(transition_json_value "$state_file" '.last_completed_transition' 'none')"
+            last_result="$(transition_json_value "$state_file" '.last_result' 'none')"
+            last_event="$(transition_json_value "$state_file" '.last_event_at' "$updated_at")"
+        else
+            unsafe_reasons="${unsafe_reasons}transition state JSON is malformed; "
+            transition_state="UNKNOWN"
+            validation_status="unsafe"
+        fi
+    fi
+
+    if [[ "$current_file_status" == "present" ]]; then
+        if jq -e . "$current_file" >/dev/null 2>&1; then
+            if [[ "$transition_id" == "none" ]]; then
+                transition_id="$(transition_json_value "$current_file" '.transition_id' 'none')"
+            fi
+            if [[ "$direction" == "none" ]]; then
+                direction="$(transition_json_value "$current_file" '.direction' 'none')"
+            fi
+        else
+            unsafe_reasons="${unsafe_reasons}current transaction JSON is malformed; "
+            validation_status="unsafe"
+        fi
+    fi
+
+    if ! transition_state_allowed "$transition_state"; then
+        unsafe_reasons="${unsafe_reasons}unknown transition state '$transition_state'; "
+        validation_status="unsafe"
+    fi
+    if ! transition_direction_allowed "$direction"; then
+        unsafe_reasons="${unsafe_reasons}unknown transition direction '$direction'; "
+        validation_status="unsafe"
+    fi
+    if [[ "$direction" == "NORMAL_TO_FIELD" || "$direction" == "NORMAL -> FIELD" ]]; then
+        if [[ "$source_mode" != "none" && "$source_mode" != "NORMAL" ]]; then
+            unsafe_reasons="${unsafe_reasons}direction/source mode contradiction; "
+            validation_status="unsafe"
+        fi
+        if [[ "$target_mode" != "none" && "$target_mode" != "FIELD" ]]; then
+            unsafe_reasons="${unsafe_reasons}direction/target mode contradiction; "
+            validation_status="unsafe"
+        fi
+    fi
+    if [[ "$direction" == "FIELD_TO_NORMAL" || "$direction" == "FIELD -> NORMAL" ]]; then
+        if [[ "$source_mode" != "none" && "$source_mode" != "FIELD" ]]; then
+            unsafe_reasons="${unsafe_reasons}direction/source mode contradiction; "
+            validation_status="unsafe"
+        fi
+        if [[ "$target_mode" != "none" && "$target_mode" != "NORMAL" ]]; then
+            unsafe_reasons="${unsafe_reasons}direction/target mode contradiction; "
+            validation_status="unsafe"
+        fi
+    fi
+
+    if transition_active_state "$transition_state" || [[ "$lock_status" == "present" || "$current_file_status" == "present" || "$pending_status" == "present" ]]; then
+        transition_active="YES"
+    fi
+
+    case "$rollback_available" in
+        true|TRUE|yes|YES)
+            rollback_available="YES"
+            ;;
+        *)
+            if [[ "$rollback_status" == "present" ]]; then
+                rollback_available="YES"
+            else
+                rollback_available="NO"
+            fi
+            ;;
+    esac
+
+    if [[ "$lock_status" == "present" ]]; then
+        blockers="transition lock exists"
+    elif [[ "$validation_status" == "unsafe" ]]; then
+        blockers="$unsafe_reasons"
+    else
+        blockers="apply execution not implemented"
+    fi
+
+    apply_prereqs="partial: status, lock, transaction, and rollback metadata framework present; mutating executor and staged recovery tests missing"
+    apply_eligible="NO"
+
+    jq -n \
+        --arg mode "$mode" \
+        --arg state "$transition_state" \
+        --arg active "$transition_active" \
+        --arg direction "$direction" \
+        --arg transition_id "$transition_id" \
+        --arg source_mode "$source_mode" \
+        --arg target_mode "$target_mode" \
+        --arg started_at "$started_at" \
+        --arg updated_at "$updated_at" \
+        --arg completed_at "$completed_at" \
+        --arg failure_reason "$failure_reason" \
+        --arg last_attempted "$last_attempted" \
+        --arg last_completed "$last_completed" \
+        --arg last_result "$last_result" \
+        --arg last_event "$last_event" \
+        --arg lock_status "$lock_status" \
+        --arg lock_detail "$lock_detail" \
+        --arg lock_file "$lock_file" \
+        --arg state_file "$state_file" \
+        --arg current_file "$current_file" \
+        --arg rollback_status "$rollback_status" \
+        --arg rollback_file "$rollback_file" \
+        --arg pending_status "$pending_status" \
+        --arg pending_file "$pending_file" \
+        --arg rollback_available "$rollback_available" \
+        --arg validation_status "$validation_status" \
+        --arg blockers "$blockers" \
+        --arg apply_gate "$TRANSITION_APPLY_GATE" \
+        --arg apply_prereqs "$apply_prereqs" \
+        --arg apply_eligible "$apply_eligible" \
+        '{
+          schema_version: 1,
+          mode: $mode,
+          transition: {
+            state: $state,
+            active: $active,
+            direction: $direction,
+            transition_id: $transition_id,
+            source_mode: $source_mode,
+            target_mode: $target_mode,
+            started_at: $started_at,
+            updated_at: $updated_at,
+            completed_at: $completed_at,
+            failure_reason: $failure_reason,
+            last_attempted_transition: $last_attempted,
+            last_completed_transition: $last_completed,
+            last_result: $last_result,
+            last_event_at: $last_event
+          },
+          lock: {
+            status: $lock_status,
+            detail: $lock_detail,
+            path: $lock_file
+          },
+          metadata: {
+            state_path: $state_file,
+            current_transaction_path: $current_file,
+            pending_path: $pending_file,
+            pending_status: $pending_status
+          },
+          rollback: {
+            available: $rollback_available,
+            status: $rollback_status,
+            path: $rollback_file
+          },
+          validation: {
+            status: $validation_status,
+            blockers: $blockers,
+            future_apply_prerequisites: $apply_prereqs,
+            future_apply_eligible: $apply_eligible,
+            apply_gate: $apply_gate
+          }
+        }'
+}
+
+transition_status_json() {
+    transition_status_values
+}
+
+transition_status() {
+    local status_json="$1"
+
+    echo
+    echo "============================================================"
+    echo "          WARPi MODE TRANSITION STATUS"
+    echo "============================================================"
+    echo
+    printf "%-32s %s\n" "Current WARPi mode:" "$(jq -r '.mode' <<<"$status_json")"
+    printf "%-32s %s\n" "Current transition state:" "$(jq -r '.transition.state' <<<"$status_json")"
+    printf "%-32s %s\n" "Transition active:" "$(jq -r '.transition.active' <<<"$status_json")"
+    printf "%-32s %s\n" "Direction:" "$(jq -r '.transition.direction' <<<"$status_json")"
+    printf "%-32s %s\n" "Transaction ID:" "$(jq -r '.transition.transition_id' <<<"$status_json")"
+    printf "%-32s %s\n" "Source mode:" "$(jq -r '.transition.source_mode' <<<"$status_json")"
+    printf "%-32s %s\n" "Target mode:" "$(jq -r '.transition.target_mode' <<<"$status_json")"
+    printf "%-32s %s\n" "Last attempted:" "$(jq -r '.transition.last_attempted_transition' <<<"$status_json")"
+    printf "%-32s %s\n" "Last completed:" "$(jq -r '.transition.last_completed_transition' <<<"$status_json")"
+    printf "%-32s %s\n" "Last result:" "$(jq -r '.transition.last_result' <<<"$status_json")"
+    printf "%-32s %s\n" "Last event:" "$(jq -r '.transition.last_event_at' <<<"$status_json")"
+    echo
+    printf "%-32s %s\n" "Lock status:" "$(jq -r '.lock.status' <<<"$status_json")"
+    printf "%-32s %s\n" "Lock detail:" "$(jq -r '.lock.detail' <<<"$status_json")"
+    printf "%-32s %s\n" "Lock path:" "$(jq -r '.lock.path' <<<"$status_json")"
+    printf "%-32s %s\n" "State metadata path:" "$(jq -r '.metadata.state_path' <<<"$status_json")"
+    printf "%-32s %s\n" "Current transaction path:" "$(jq -r '.metadata.current_transaction_path' <<<"$status_json")"
+    printf "%-32s %s\n" "Pending metadata:" "$(jq -r '.metadata.pending_status' <<<"$status_json")"
+    printf "%-32s %s\n" "Pending metadata path:" "$(jq -r '.metadata.pending_path' <<<"$status_json")"
+    printf "%-32s %s\n" "Rollback metadata:" "$(jq -r '.rollback.status' <<<"$status_json")"
+    printf "%-32s %s\n" "Rollback available:" "$(jq -r '.rollback.available' <<<"$status_json")"
+    printf "%-32s %s\n" "Rollback metadata path:" "$(jq -r '.rollback.path' <<<"$status_json")"
+    echo
+    printf "%-32s %s\n" "Validation status:" "$(jq -r '.validation.status' <<<"$status_json")"
+    printf "%-32s %s\n" "Future apply eligible:" "$(jq -r '.validation.future_apply_eligible' <<<"$status_json")"
+    printf "%-32s %s\n" "Future apply prerequisites:" "$(jq -r '.validation.future_apply_prerequisites' <<<"$status_json")"
+    printf "%-32s %s\n" "Apply gate:" "$(jq -r '.validation.apply_gate' <<<"$status_json")"
+    printf "%-32s %s\n" "Blockers:" "$(jq -r '.validation.blockers' <<<"$status_json")"
+    echo
+    echo "============================================================"
+}
+
+transition_dry_run_summary() {
+    local direction="$1"
+    local source_mode="$2"
+    local target_mode="$3"
+    local status_json lock_status active validation blockers eligible
+
+    status_json="$(transition_status_values)"
+    lock_status="$(jq -r '.lock.status' <<<"$status_json")"
+    active="$(jq -r '.transition.active' <<<"$status_json")"
+    validation="$(jq -r '.validation.status' <<<"$status_json")"
+    blockers="$(jq -r '.validation.blockers' <<<"$status_json")"
+    eligible="$(jq -r '.validation.future_apply_eligible' <<<"$status_json")"
+
+    echo
+    echo "TRANSITION FRAMEWORK"
+    echo "------------------------------------------------------------"
+    printf "%-22s %s\n" "Direction:" "$direction"
+    printf "%-22s %s\n" "Intended source:" "$source_mode"
+    printf "%-22s %s\n" "Intended target:" "$target_mode"
+    printf "%-22s %s\n" "Current state:" "$(jq -r '.transition.state' <<<"$status_json")"
+    printf "%-22s %s\n" "Transition active:" "$active"
+    printf "%-22s %s\n" "Lock status:" "$lock_status"
+    printf "%-22s %s\n" "Validation:" "$validation"
+    printf "%-22s %s\n" "Future apply:" "$eligible"
+    printf "%-22s %s\n" "Blockers:" "$blockers"
+    echo "Dry run does not create, update, or clear transition metadata."
 }
 
 mode_status() {
@@ -213,6 +593,7 @@ mode_enter_field_plan() {
     printf "%-22s %s\n" "IPv4 address:" "$field_ipv4_addresses"
     printf "%-22s %s\n" "IPv6 method:" "$field_ipv6_method"
     printf "%-22s %s\n" "Field marker:" "$marker_status ($FIELD_MARKER)"
+    transition_dry_run_summary "NORMAL -> FIELD" "$mode" "FIELD"
     echo
     echo "PROPOSED APPLY SEQUENCE"
     echo "------------------------------------------------------------"
@@ -312,6 +693,7 @@ mode_return_normal_plan() {
     printf "%-22s %s\n" "IPv4 address:" "$field_ipv4_addresses"
     printf "%-22s %s\n" "IPv6 method:" "$field_ipv6_method"
     printf "%-22s %s\n" "Field marker:" "$marker_status ($FIELD_MARKER)"
+    transition_dry_run_summary "FIELD -> NORMAL" "$mode" "NORMAL"
     echo
     echo "PROPOSED RETURN SEQUENCE"
     echo "------------------------------------------------------------"
@@ -420,6 +802,21 @@ case "${1:-help}" in
         case "${2:-status}" in
             status)
                 mode_status
+                ;;
+            transition-status)
+                case "${3:-}" in
+                    ""|--human)
+                        transition_status "$(transition_status_values)"
+                        ;;
+                    --json)
+                        transition_status_json
+                        ;;
+                    *)
+                        echo "Unknown transition-status option: $3" >&2
+                        echo "Try: warpi mode transition-status" >&2
+                        exit 2
+                        ;;
+                esac
                 ;;
             enter-field)
                 case "${3:-}" in

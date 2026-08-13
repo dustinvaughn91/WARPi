@@ -25,6 +25,7 @@ User-facing status is provided by:
 - `warpi help`
 - `warpi status`
 - `warpi mode status`
+- `warpi mode transition-status`
 - `warpi mode enter-field` dry-run plan
 - `warpi mode return-normal` dry-run plan
 - `warpi wireless status` read-only sidecar reachability
@@ -43,11 +44,25 @@ WARPi currently has two intended operating modes:
 - `NORMAL`: trusted network client mode.
 - `FIELD`: portable field assessment mode.
 
-Current mode reporting is implemented by `warpi-kernel.service`, supporting modules, and the `warpi mode status` command. `kernel-report` and `kernel-doc-audit` report the maintained dispatcher and dry-run planners as the current mode-control surface. `warpi mode enter-field` and `warpi mode return-normal` currently render dry-run transition plans only; they do not change files, services, routes, radios, or NetworkManager profiles. Real mode transition implementation remains gated because the apply workflow and rollback path are not approved yet. `warpi mode enter-field --apply` and `warpi mode return-normal --apply` are not enabled yet.
+Current mode reporting is implemented by `warpi-kernel.service`, supporting modules, and the `warpi mode status` command. `kernel-report` and `kernel-doc-audit` report the maintained dispatcher and dry-run planners as the current mode-control surface. `warpi mode transition-status` reports the non-mutating Milestone A transition framework: state-machine status, active transaction detection, lock path/status, transaction metadata paths, rollback metadata presence, validation status, and the apply gate. `warpi mode enter-field` and `warpi mode return-normal` currently render dry-run transition plans only; they do not change files, services, routes, radios, or NetworkManager profiles. Real mode transition implementation remains gated because the mutating executor, rollback implementation, boot recovery behavior, and staged live tests are not approved yet. `warpi mode enter-field --apply` and `warpi mode return-normal --apply` are not enabled yet.
 
 See [mode-control investigation](mode-control-investigation.md).
 
 Future real mode switching must follow the reversible transaction design in [mode transition design](mode-transition-design.md). That design keeps remote management survivability as a primary safety property and requires state-machine, rollback, boot recovery, observability, and staged tests before apply mode can be enabled.
+
+## Transition Control Plane
+
+Milestone A provides a read-only transition control plane behind `warpi mode`. The state model recognizes `IDLE`, `PREPARING`, `VALIDATING`, `READY`, `APPLYING`, `VERIFYING`, `COMPLETED`, `ROLLING_BACK`, `ROLLED_BACK`, and `FAILED`. Directions are represented as `NORMAL_TO_FIELD` or `FIELD_TO_NORMAL`.
+
+Runtime transition metadata is expected under `/run/warpi`:
+
+- `/run/warpi/mode-transition.lock`
+- `/run/warpi/mode-transition-state.json`
+- `/run/warpi/mode-transition-current.json`
+
+Persistent recovery metadata is expected under `/var/lib/warpi/mode-transitions`, with rollback metadata at `/var/lib/warpi/mode-transitions/rollback-plan.json` and pending transition metadata at `/var/lib/warpi/mode-transitions/pending-transition.json`.
+
+`warpi mode transition-status` treats missing metadata as a clean inactive/IDLE state, but malformed JSON, symlinked metadata paths, unknown states, contradictory source/target directions, existing locks, or interrupted transaction metadata are surfaced clearly and block future apply eligibility. Dry-run planners use this framework for visibility but do not create or clear transition metadata.
 
 ## Wireless Sidecar Model
 
@@ -63,6 +78,7 @@ flowchart TD
     WebShell --> WARPi
 
     WARPi --> State[/run/warpi/state.json]
+    WARPi --> Txn[/run/warpi mode transition metadata]
     WARPi --> UI[TFT status UI]
     WARPi --> GPS[GPSD / u-blox GPS]
     WARPi --> WiFi[Wireless adapters]

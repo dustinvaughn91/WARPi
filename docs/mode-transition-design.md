@@ -9,7 +9,7 @@ Current production behavior remains:
 - `warpi mode enter-field --apply` exits with refusal.
 - `warpi mode return-normal --apply` exits with refusal.
 
-The next implementation session should start with Milestone A in this document: state machine and transaction framework with no live mutations.
+Milestone A is implemented as a read-only state-machine and transaction-status framework with no live mode mutations.
 
 ## Current Baseline
 
@@ -151,9 +151,35 @@ Expected unavailable or non-required resources:
 - Mission Control may remain offline and must not block local field operation.
 - Field Mode does not imply active wireless testing, deauth, capture, PineAP, or other offensive behavior.
 
-## State Machine
+## Milestone A Transition Status
 
-States:
+`warpi mode transition-status` exposes the current transition subsystem state for operators and automation. It reports current WARPi mode, transition state, active transition detection, direction, transaction ID, last attempted/completed transition fields, lock status, metadata paths, rollback metadata presence, validation status, apply blockers, and why live apply remains gated. `warpi mode transition-status --json` emits the same information in a structured form.
+
+Missing transition metadata is treated as clean inactive/IDLE status. Malformed metadata, unsafe symlinked metadata paths, unknown state names, contradictory source/target direction fields, existing locks, pending metadata, or current transaction files are surfaced rather than silently reset.
+
+Milestone A states:
+
+- `IDLE`
+- `PREPARING`
+- `VALIDATING`
+- `READY`
+- `APPLYING`
+- `VERIFYING`
+- `COMPLETED`
+- `ROLLING_BACK`
+- `ROLLED_BACK`
+- `FAILED`
+
+Milestone A transition directions:
+
+- `NORMAL_TO_FIELD`
+- `FIELD_TO_NORMAL`
+
+The dry-run planners for `warpi mode enter-field` and `warpi mode return-normal` display transition framework status but do not create, update, or delete transition metadata.
+
+## Future Runtime Mode State Machine
+
+Future live mode states:
 
 - `NORMAL`: trusted-client mode.
 - `ENTERING_FIELD`: apply transaction is moving toward Field Mode.
